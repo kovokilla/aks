@@ -1,0 +1,31 @@
+# Terraform
+*.tfstate
+*.tfstate.old
+*.tfplan
+.terraform/
+crash.log
+.tfls.lock
+
+# Node.js
+node_modules/
+package-lock.json
+npm-debug.log
+
+# Misc
+.DS_Store
+.env
+*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+venv/
+env/

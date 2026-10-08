@@ -1,0 +1,13 @@
+{
+  "name": "azure-aks-demo-app",
+  "version": "1.0.0",
+  "description": "Sample app for Azure AKS CI/CD",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

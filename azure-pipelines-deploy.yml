@@ -1,0 +1,79 @@
+trigger:
+- main
+- master
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+- group: aks-secrets
+
+steps:
+- task: AzureCLI@2
+  displayName: 'Login to Azure'
+  inputs:
+    azureSubscription: 'azure-service-connection'
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      echo "Logging in to Azure..."
+      az account show
+
+- task: TerraformCLI@0
+  displayName: 'Set K8s Credentials'
+  inputs:
+    command: 'custom'
+    workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+    customOptions: |
+      bash -c "az aks get-credentials --resource-group $(RESOURCE_GROUP_NAME) --name $(AKS_CLUSTER_NAME) --overwrite-existing"
+  env:
+    AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+
+- task: Kubernetes@1
+  displayName: 'Create Namespace'
+  inputs:
+    connectionType: 'Kubernetes Service Connection'
+    kubernetesServiceEndpoint: 'aks-service-connection'
+    namespace: 'production'
+    command: 'apply'
+    useConfigurationFile: true
+    configurations: '/k8s/namespace.yaml'
+    deleteResources: false
+
+- task: Kubernetes@1
+  displayName: 'Deploy to AKS'
+  inputs:
+    connectionType: 'Kubernetes Service Connection'
+    kubernetesServiceEndpoint: 'aks-service-connection'
+    namespace: 'production'
+    command: 'apply'
+    useConfigurationFile: true
+    configurations: |
+      /k8s/deployment.yaml
+      /k8s/service.yaml
+      /k8s/ingress.yaml
+
+- task: Kubernetes@1
+  displayName: 'Verify Deployment'
+  inputs:
+    connectionType: 'Kubernetes Service Connection'
+    kubernetesServiceEndpoint: 'aks-service-connection'
+    namespace: 'production'
+    command: 'get'
+    arguments: 'deployments,pods,services -o wide'
+
+- task: Kubernetes@1
+  displayName: 'Scale Deployment'
+  inputs:
+    connectionType: 'Kubernetes Service Connection'
+    kubernetesServiceEndpoint: 'aks-service-connection'
+    namespace: 'production'
+    command: 'scale'
+    arguments: 'deployment/app-deployment --replicas=3'
+
+- script: |
+    echo "Deploying application to AKS..."
+    kubectl rollout status deployment/app-deployment --timeout=300s
+  displayName: 'Wait for Rollout'
+  env:
+    KUBECONFIG: $(KUBECONFIG)
