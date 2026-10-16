@@ -98,6 +98,22 @@ azure-aks-demo/
 
 ## Azure DevOps Setup
 
+### Subscription Checker Pipeline
+
+To verify the Azure service connection without deploying resources:
+
+1. In Azure DevOps, create a pipeline using this GitHub repository.
+2. Select **Existing Azure Pipelines YAML file**, choose branch
+   `feat/pipe-checker`, and select `/azure-pipelines-checker.yml`.
+3. Ensure an Azure Resource Manager service connection named
+   `azure-service-connection` exists and authorize this pipeline to use it.
+   If your connection has a different name, update `azureSubscription` in the YAML.
+4. Run the pipeline manually. The **Print Azure subscription ID** step outputs
+   the active subscription ID associated with the service connection.
+
+The checker has no automatic push or pull-request triggers, does not require
+the `aks-secrets` variable group, and does not create or modify Azure resources.
+
 ### Variables Group: `aks-secrets`
 
 | Variable | Description |
