@@ -126,6 +126,17 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn(credential, hcl)
 
 
+    def test_cli_backend_auth_is_explicit(self):
+        hcl = bootstrap.backend_hcl(config(), "cli")
+        self.assertIn("use_azuread_auth = true", hcl)
+        self.assertIn("use_oidc = false", hcl)
+        self.assertIn("use_cli = true", hcl)
+
+    def test_invalid_backend_auth_rejected(self):
+        with self.assertRaises(ValueError):
+            bootstrap.backend_hcl(config(), "access-key")
+
+
 class BootstrapTests(unittest.TestCase):
     def setUp(self):
         self.config = config()

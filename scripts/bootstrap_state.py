@@ -66,12 +66,17 @@ def load_config(path):
     return config
 
 
-def backend_hcl(config):
-    """Noncredential settings only; native OIDC identity is supplied at runtime."""
+def backend_hcl(config, auth_mode="oidc"):
+    """Noncredential settings only; CLI login or native OIDC supplies identity."""
+    if auth_mode not in ("oidc", "cli"):
+        raise ValueError("Backend auth mode must be oidc or cli.")
     fields = ("resource_group_name", "storage_account_name", "container_name",
               "key", "subscription_id", "tenant_id")
     lines = [f"{field} = {json.dumps(config[field])}" for field in fields]
-    return "\n".join(lines + ["use_azuread_auth = true", "use_oidc = true"]) + "\n"
+    lines += ["use_azuread_auth = true",
+              "use_oidc = " + ("true" if auth_mode == "oidc" else "false"),
+              "use_cli = " + ("true" if auth_mode == "cli" else "false")]
+    return "\n".join(lines) + "\n"
 
 
 class Azure:
@@ -201,7 +206,9 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="Create/harden Azure state storage.")
     mode.add_argument("--print-backend-config", action="store_true",
-                      help="Print backend HCL for native OIDC; no Azure calls.")
+                      help="Print backend HCL; no Azure calls.")
+    parser.add_argument("--backend-auth", choices=("oidc", "cli"), default="oidc",
+                        help="Authentication for rendered backend HCL (default: oidc).")
     parser.add_argument("--confirm-subscription", help="Must exactly match config before --apply.")
     parser.add_argument("--pipeline-principal-object-id",
                         help="Enterprise application's service principal Object ID, NOT client ID.")
@@ -209,7 +216,7 @@ def main(argv=None):
     try:
         config = load_config(args.config)
         if args.print_backend_config:
-            print(backend_hcl(config), end="")
+            print(backend_hcl(config, args.backend_auth), end="")
             return 0
         if not args.apply:
             print("PREVIEW ONLY: no Azure requests or changes; availability/permissions not checked.")

@@ -1,15 +1,19 @@
 # AKS Playground
 
 A playground for an Azure DevOps subscription checker and a separate,
-Terraform-managed AKS sandbox. Implementation is incremental: this first step
-adds state-storage bootstrap tooling only, not AKS provisioning or destruction.
+Terraform-managed AKS sandbox. State-storage bootstrap and sandbox Terraform
+configuration are implemented. Automated create/destroy pipelines are not yet added.
 
 ## Repository contents
 
 - `azure-pipelines-checker.yml`: manually triggered subscription checker.
 - `config/backend.json`: nonsecret playground state-storage settings.
 - `scripts/bootstrap_state.py`: guarded, one-time Azure state-storage bootstrap.
-- `tests/test_bootstrap_state.py`: offline tests with faked Azure responses.
+- `scripts/init_backend.py`: initialize the Azure backend with a human CLI login.
+- `scripts/install_terraform.py`: checksum-verified pinned Terraform installation.
+- `terraform/`: sandbox resources, remote backend declaration, inputs, outputs,
+  signed provider lockfile, and targeted mock-plan tests.
+- `tests/`: offline bootstrap, backend initialization, and installer unit tests.
 - `.gitignore`: excludes credentials, state, plans, and local overrides.
 - `README.md`: step-by-step process, usage, and validation status.
 
@@ -102,8 +106,8 @@ not validate AKS access, resource deployment permissions, or infrastructure.
 Terraform's future create/destroy pipelines must share durable state instead of
 leaving it on disposable agents. State storage lives in a separate resource group,
 outside the future sandbox's Terraform state, so destroying the sandbox will not
-destroy its state history. No create/destroy pipeline or Terraform resources are
-implemented in this commit.
+destroy its state history. The sandbox configuration introduced in step 2 does
+not declare or import these persistent storage resources.
 
 The committed playground settings are:
 
@@ -256,9 +260,10 @@ python3 scripts/bootstrap_state.py --print-backend-config > config/backend.local
 ```
 
 The generated file is ignored. It enables Entra data-plane authentication and
-native OIDC; later commits will add the Terraform backend block and federated
-pipeline identity/token configuration. It is not a complete standalone Terraform
-setup yet. Blob leases provide Terraform state locking once that backend is used.
+native OIDC for future pipeline use. The backend declaration is in
+`terraform/backend.tf`; federated pipeline identity/token wiring is still pending.
+For a human Cloud Shell login, use the CLI-authenticated initializer in step 2
+instead. Blob leases provide state locking once the backend is used.
 Never commit state or saved plans: they may contain sensitive values.
 
 ### Local validation and next steps
@@ -274,8 +279,9 @@ guards, security flags, ownership/collision checks, resumable bootstrap, scoped
 RBAC, and credential-free CLI construction using faked responses.
 These tests do **not** establish that Azure permissions or names are valid.
 
-Local validation: all 24 offline unit tests passed, preview/backend rendering
-worked, and whitespace checks passed. The subscription checker is unchanged.
+Bootstrap follow-up validation: all 24 then-existing unit tests passed,
+preview/backend rendering worked, and whitespace checks passed.
+The subscription checker is unchanged.
 
 ### Live validation record — 2026-10-17
 
@@ -295,12 +301,167 @@ configuration and role-assignment commands completed without an error.
 This evidence was supplied from Cloud Shell, not independently collected from
 the local development machine.
 
-Remaining verification: independently read back the account's HTTPS/TLS/shared-key
-settings and blob versioning/retention, and test blob-data access using the
-pipeline identity after RBAC propagation. Human Owner access alone does not prove
-pipeline data-plane access. Terraform has not been run and there is no verified
-Terraform state blob yet. No AKS/ACR create or destroy operation was performed.
+The operator subsequently supplied account/blob-service readbacks confirming:
+HTTPS-only `true`, minimum TLS `TLS1_2`, public blob access `false`, shared-key
+authentication `false`, versioning `true`, and enabled 14-day blob/container soft
+delete. This confirms the storage configuration through operator-provided evidence.
 
-Subsequent commits will add the Terraform sandbox, shared pipeline tooling,
+Remaining verification: backend initialization and blob-data access using the
+pipeline identity. Human Owner access alone does not prove pipeline data-plane
+access. No live Terraform initialization, plan, apply, or destroy has been
+verified, and there is no verified Terraform state blob yet.
+
+Subsequent commits will add shared pipeline tooling,
 manual creation pipeline, guarded destruction pipeline, and the final lifecycle
 walkthrough. Each will update this README with its own usage and validation.
+
+## Infrastructure lifecycle: step 2 — Terraform configuration and backend access
+
+### What is defined, but not deployed
+
+The root module in `terraform/` defines four managed resources:
+
+1. `aks-sandbox-rg`: separate sandbox resource group in North Europe.
+2. `akssandbox2c209a53`: Basic ACR with admin credentials disabled.
+3. `aks-sandbox`: Free-tier AKS control plane with a VMSS-backed `system` pool,
+   one `Standard_D2s_v5` node, Azure CNI overlay, managed identity, and Entra/Azure
+   RBAC with local accounts disabled. Node count is fixed, not autoscaled.
+4. An `AcrPull` assignment for the kubelet identity scoped only to the new ACR.
+
+AKS creates/manages `aks-sandbox-nodes-rg` and its VMSS, networking, identity, and
+outbound public IP. Terraform does not independently manage those generated
+resources, the shared Network Watcher, or any existing `fitxmatt` resources.
+Changing IP addresses during recreation is expected. There are no application
+deployments, images, certificates, or workload backups.
+
+`terraform/sandbox.auto.tfvars.json` is the common source of sandbox names and
+sizing. `config/backend.json` supplies the subscription, tenant, environment,
+location, and backend settings. The provider reads that committed backend JSON;
+a bootstrap-only local override does not automatically retarget the sandbox.
+For a different environment, update these sources together and review state
+migration separately. Guardrails reject non-sandbox names and colliding groups.
+
+Terraform is pinned to **1.13.3** and AzureRM to **4.48.0**, with provider checksums
+locked for Linux amd64 and macOS arm64. These are fixed, validated versions, not
+a claim to be the newest releases. Kubernetes defaults to Azure's recommended
+version at creation rather than an obsolete fixed version; pin a supported
+version in the input file if reproducibility across different dates is required.
+
+No automatic resource-provider registration is performed, even during plan.
+Before a future apply, an administrator must ensure `Microsoft.ContainerService`,
+`Microsoft.ContainerRegistry`, `Microsoft.Compute`, `Microsoft.Network`, and
+`Microsoft.ManagedIdentity` are registered. VM quota, SKU/version availability,
+ACR name availability, and Azure policies still require a real Azure check.
+Deployment requires resource-creation permissions and permission to assign
+`AcrPull`; Reader-only checker access is insufficient. Kubernetes workload access
+requires separate AKS Azure RBAC assignments.
+
+### Initialize the backend in Cloud Shell without applying
+
+Use a fresh checkout of `feat/terraform-lifecycle` until it is merged. Earlier
+Cloud Shell checkouts may have manual patches: preserve them instead of using
+`git reset --hard` or overwriting files.
+
+From the repository root, install the pinned Terraform into a temporary directory:
+
+```bash
+TF_TOOLS_DIR=$(mktemp -d)
+python3 scripts/install_terraform.py --directory "$TF_TOOLS_DIR" &&
+export PATH="$TF_TOOLS_DIR:$PATH"
+terraform version
+```
+
+The installer downloads only the fixed version from HashiCorp's HTTPS release
+host, checks its archive SHA-256 against the release manifest, and refuses to
+overwrite an existing binary. It does not install globally or use sudo. The
+manifest is fetched over HTTPS; this is not detached-signature verification.
+
+With the expected Azure CLI account signed in, run:
+
+```bash
+az account set --subscription 2c209a53-b9e9-4c5e-8ecf-217c5889ecd7 &&
+python3 scripts/init_backend.py
+```
+
+The initializer checks the pinned version and target subscription/tenant,
+generates temporary noncredential backend settings, and runs only:
+`terraform init -reconfigure -input=false -lockfile=readonly`.
+It uses Entra data-plane authentication through the human CLI session, disables
+OIDC for that operation, removes inherited ARM authentication/CLI-argument
+overrides from its child process, and deletes its temporary settings afterward.
+Local initialization metadata/provider caches stay under ignored `.terraform/`.
+It never migrates state, applies infrastructure, or destroys resources.
+Initialization can initialize backend metadata/an empty state blob; this is not
+an AKS/ACR deployment.
+
+Expected output includes `Successfully configured the backend "azurerm"` and
+`Backend initialization succeeded using the current Azure CLI identity.`
+This verifies that identity's initialization operations only, not full
+read/write/locking behavior or pipeline access.
+
+### If backend initialization reports a data-plane 403
+
+Subscription Owner does not automatically grant Entra blob-data access. The
+bootstrap granted that role to the pipeline service principal, not to your human
+Cloud Shell account. If needed, an authorized administrator can explicitly grant
+your user the same role at container scope:
+
+```bash
+CURRENT_USER_OBJECT_ID=$(az ad signed-in-user show --query id --output tsv) &&
+az role assignment create \
+  --subscription 2c209a53-b9e9-4c5e-8ecf-217c5889ecd7 \
+  --assignee-object-id "$CURRENT_USER_OBJECT_ID" \
+  --assignee-principal-type User \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/2c209a53-b9e9-4c5e-8ecf-217c5889ecd7/resourceGroups/aks-tfstate-rg/providers/Microsoft.Storage/storageAccounts/akstfstate2c209a53/blobServices/default/containers/tfstate" \
+  --query '{principalId:principalId,scope:scope}' --output json
+```
+
+That command changes permissions; it is not run automatically by the initializer.
+Complete MFA if required, allow role propagation, then rerun initialization.
+Do not enable shared keys or fetch account keys to bypass a 403.
+
+### Validation and optional real plan
+
+After successful initialization, validate before planning:
+
+```bash
+terraform -chdir=terraform fmt -check -recursive &&
+terraform -chdir=terraform validate
+```
+
+When authorized to inspect the proposed sandbox, a real plan (no apply) is:
+
+```bash
+terraform -chdir=terraform plan -input=false -lock-timeout=5m -out=sandbox.tfplan
+```
+
+For an empty sandbox state, expect four managed resource creations and no changes
+to state-storage or existing `fitxmatt` resources. Stop if the plan differs
+unexpectedly. Never use `-target` for the real lifecycle plan. Saved plans and
+state may contain sensitive data; they are ignored and must not be shared.
+Do not run `apply` yet.
+
+Offline local validation uses:
+
+```bash
+terraform -chdir=terraform init -backend=false -input=false
+terraform -chdir=terraform validate
+terraform -chdir=terraform test
+python3 -m unittest discover -s tests -v
+```
+
+The five Terraform tests use a mocked provider and intentionally target resources
+to avoid AzureRM's generated kubelet-identity block, which generic mocks do not
+reproduce. They check sandbox naming, VMSS settings, ACR/local-account security,
+node count, and group isolation. They do **not** validate the full RBAC graph or
+contact Azure. Provider-schema validation covers all declared resource arguments.
+The real Cloud Shell plan is still needed for the complete graph and Azure
+permissions. Test teardown refers only to mock state, not live resources.
+
+Local results: Terraform formatting and schema validation passed; all five
+targeted Terraform tests and all 37 Python unit tests passed. Provider packages
+were downloaded from HashiCorp and their signed registry checksums locked.
+Local initialization used `-backend=false` only. Live backend initialization
+remains pending operator output from Cloud Shell; no successful Azure init,
+live plan, apply, or destroy is claimed.
