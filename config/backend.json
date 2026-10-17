@@ -1,0 +1,10 @@
+{
+  "subscription_id": "2c209a53-b9e9-4c5e-8ecf-217c5889ecd7",
+  "tenant_id": "b52fb23a-78d5-4082-b308-dbc1f513bebb",
+  "location": "northeurope",
+  "environment": "aks-sandbox",
+  "resource_group_name": "aks-tfstate-rg",
+  "storage_account_name": "akstfstate2c209a53",
+  "container_name": "tfstate",
+  "key": "sandbox/terraform.tfstate"
+}
