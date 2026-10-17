@@ -1,223 +1,91 @@
-# Azure AKS Cluster Infrastructure (Azure DevOps CI/CD)
+# Azure Subscription Checker
 
-A complete Terraform-based infrastructure for deploying applications to Azure Kubernetes Service with Azure DevOps for CI/CD.
+A minimal Azure DevOps pipeline that verifies Azure authentication and prints
+the subscription ID associated with an Azure Resource Manager service connection.
 
-## Architecture
+## Repository contents
 
-```
-GitHub Repo (Source Only)
-    │
-    ├── Azure DevOps Builder (CI)
-    │       └── Build Docker Image → Azure Container Registry
-    │
-    ├── Azure DevOps Release (CD)  
-    │       └── Deploy to AKS
-    │
-    └── Terraform (Infrastructure)
-            └── AKS Cluster in Azure
-```
+- `azure-pipelines-checker.yml`: manually triggered subscription checker.
+- `README.md`: setup, usage, and troubleshooting instructions.
+
+There is no AKS deployment, Terraform infrastructure, application, or image build
+in this repository. The checker does not create, update, or delete Azure resources.
 
 ## Prerequisites
 
-1. **Azure Subscription** - With contributor rights
-2. **Terraform 1.8+** - Installed locally
-3. **Azure CLI** - Logged in (`az login`)
-4. **kubectl** - For managing AKS cluster
-5. **GitHub Account** - For source control
-6. **Azure DevOps Organization** - For CI/CD pipelines
+- An Azure DevOps project with access to this GitHub repository.
+- An Azure subscription and an identity authorized to access it.
+- An **Azure Resource Manager** service connection named
+  `azure-service-connection` in the same Azure DevOps project.
+- Access to a Microsoft-hosted `ubuntu-latest` agent and available parallel-job
+  capacity.
 
-## Quick Start
+A GitHub service connection (such as `github.com_kovokilla`) provides repository
+access only. It cannot replace the Azure Resource Manager connection.
 
-### 1. Deploy Infrastructure (Terraform)
+## Configure the Azure connection
 
-```bash
-# Clone the repo
-git clone https://github.com/kovokilla/aks.git
-cd aks
+1. Open **Project settings → Service connections → New service connection**.
+2. Select **Azure Resource Manager** and use **Workload identity federation**.
+3. Use automatic app registration if permitted, or a manually configured app
+   registration with a federated credential.
+4. Select the intended subscription and name the connection
+   `azure-service-connection`. If using another name, update `azureSubscription`
+   in the pipeline YAML to match.
+5. Under **Pipeline permissions**, authorize only the checker pipeline rather
+   than granting access to all pipelines.
 
-# Initialize Terraform
-cd terraform
-terraform init
+The checker does not require Contributor access; Reader at the selected scope
+is sufficient. Creating the connection automatically may require additional
+permissions to register applications and assign Azure roles. Those setup
+permissions are separate from the pipeline identity's runtime permissions.
+Complete MFA when Azure requires it during connection setup. No client secret
+is needed for workload identity federation.
 
-# Customize variables (optional)
-cat > terraform.tfvars << EOF
-resource_group_name = "aks-production-rg"
-location            = "West Europe"
-aks_cluster_name    = "aks-production"
-node_count          = 3
-kubernetes_version  = "1.29"
-EOF
+## Create and run the pipeline
 
-# Plan
-terraform plan -out=tfplan
+1. In Azure DevOps, select **Pipelines → New pipeline → GitHub** and choose
+   `kovokilla/aks`.
+2. Select **Existing Azure Pipelines YAML file**.
+3. Choose the branch containing this checker-only setup (`chore/checker-only`
+   once pushed, or `main` after merging) and select
+   `/azure-pipelines-checker.yml`.
+4. Save the pipeline and select **Run pipeline**.
+5. If the run waits for resource access, use **View → Permit** to authorize
+   the Azure service connection, or ask its administrator to grant access.
 
-# Apply
-terraform apply tfplan
+Both push and pull-request triggers are disabled. Run the checker manually;
+no variable group, local Azure CLI installation, or local Azure sign-in is needed.
 
-# Get credentials
-az aks get-credentials --resource-group aks-production-rg --name aks-production --overwrite-existing
-```
+## Expected output
 
-### 2. Configure Azure DevOps
-
-1. Create Azure DevOps organization and project
-2. Create Service Connections:
-   - **Azure Resource Manager** - For Terraform deployment
-   - **Azure Kubernetes** - For AKS deployment  
-   - **Docker Registry** - For ACR (if using Azure Container Registry)
-
-3. Create Azure Repos pipeline using `azure-pipelines.yml`
-
-4. Set up pipeline triggers on GitHub commits
-
-## File Structure
-
-```
-azure-aks-demo/
-├── terraform/
-│   ├── providers.tf        # Azure provider configuration
-│   ├── variables.tf        # Infrastructure variables
-│   ├── main.tf             # AKS cluster and resources
-│   └── outputs.tf          # Cluster outputs/credentials
-│
-├── k8s/
-│   ├── namespace.yaml      # Kubernetes namespace
-│   ├── deployment.yaml     # App deployment
-│   ├── service.yaml        # LoadBalancer service
-│   └── ingress.yaml        # Ingress controller config
-│
-├── app/
-│   ├── Dockerfile          # Docker image definition
-│   ├── server.js           # Sample Node.js application
-│   └── package.json        # Node.js dependencies
-│
-├── azure-pipelines.yml     # Azure DevOps build pipeline
-├── azure-pipelines-deploy.yml  # Azure DevOps deploy pipeline
-└── README.md               # This file
-```
-
-## Azure DevOps Setup
-
-### Subscription Checker Pipeline
-
-To verify the Azure service connection without deploying resources:
-
-1. In Azure DevOps, create a pipeline using this GitHub repository.
-2. Select **Existing Azure Pipelines YAML file**, choose branch
-   `feat/pipe-checker`, and select `/azure-pipelines-checker.yml`.
-3. Ensure an Azure Resource Manager service connection named
-   `azure-service-connection` exists and authorize this pipeline to use it.
-   If your connection has a different name, update `azureSubscription` in the YAML.
-4. Run the pipeline manually. The **Print Azure subscription ID** step outputs
-   the active subscription ID associated with the service connection.
-
-The checker has no automatic push or pull-request triggers, does not require
-the `aks-secrets` variable group, and does not create or modify Azure resources.
-
-### Variables Group: `aks-secrets`
-
-| Variable | Description |
-|----------|-------------|
-| AZURE_SUBSCRIPTION_ID | Your Azure subscription ID |
-| RESOURCE_GROUP_NAME | AKS resource group name |
-| AKS_CLUSTER_NAME | AKS cluster name |
-| STATE_STORAGE_ACCOUNT | Terraform state storage |
-| CONTAINER_REGISTRY_NAME | Azure Container Registry name |
-
-### Pipeline Triggers
-
-```yaml
-trigger:
-  branches:
-    include:
-      - main
-      - develop
-```
-
-## Post-Deployment
-
-### Access Application
+Open the **Print Azure subscription ID** step in the run logs. The task signs in
+using the service connection and executes:
 
 ```bash
-# Get the external IP
-kubectl get service app-service -n production
-
-# Access the app
-curl http://<EXTERNAL_IP>
+az account show --query id --output tsv
 ```
 
-### Monitor Cluster
+The command prints the active subscription ID as a UUID. Compare it with the
+subscription ID in Azure portal to confirm the connection targets the intended
+subscription. Azure CLI task setup may print additional log messages.
 
-```bash
-# Check nodes
-kubectl get nodes
-
-# Check pods
-kubectl get pods -n production
-
-# View logs
-kubectl logs -l app=azure-aks-demo -n production --tail=100
-```
-
-## Cleanup
-
-```bash
-# Delete Kubernetes resources
-kubectl delete namespace production
-
-# Destroy infrastructure
-cd terraform
-terraform destroy
-```
-
-## Configuration Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `resource_group_name` | aks-cluster-rg | Azure Resource Group |
-| `location` | West Europe | Azure Region |
-| `aks_cluster_name` | aks-cluster | Cluster Name |
-| `kubernetes_version` | 1.29 | Kubernetes version |
-| `node_count` | 3 | Initial node count |
-| `node_vm_size` | Standard_D4s_v3 | Node VM size |
-
-## Cost Estimation
-
-- **AKS Cluster**: ~$200-400/month (3 × Standard_D4s_v3)
-- **Log Analytics**: ~$30/month
-- **Storage**: ~$10/month
-- **Total**: ~$240-440/month
-
-## Security Features
-
-- ✅ RBAC enabled
-- ✅ System-assigned managed identity
-- ✅ Network policy (Azure CNI)
-- ✅ AAD integration ready
-- ✅ Monitoring via Azure Monitor
-- ✅ TLS enabled (Ingress)
+A successful run verifies authentication and subscription selection only. It does
+not validate AKS access, resource deployment permissions, or infrastructure.
 
 ## Troubleshooting
 
-**RBAC permission errors:**
-```bash
-az aks get-credentials --resource-group <rg> --name <cluster> --admin
-```
-
-**Image pull errors:**
-- Check image name in deployment.yaml
-- Verify Azure Container Registry permissions
-- Ensure AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are set
-
-**Ingress controller not ready:**
-```bash
-kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/azure/deploy.yaml
-```
-
-## Next Steps
-
-1. Enable Azure Monitor for containers
-2. Set up Azure Key Vault for secrets
-3. Implement Horizontal Pod Autoscaler
-4. Add Azure Front Door for global traffic
-5. Enable multi-region deployment for HA
+- **Service connection missing or unauthorized:** check the exact connection
+  name, its Azure Resource Manager type, and its pipeline permissions in this
+  project.
+- **Run waiting for resource permission:** authorize this pipeline to use the
+  connection; authorization is separate from Azure role assignments.
+- **Variable group not found:** confirm the pipeline loads
+  `/azure-pipelines-checker.yml`; this checker uses no variable groups.
+- **MFA required during connection creation:** authenticate the account creating
+  the connection with MFA, then retry. Manual setup does not bypass MFA rules.
+- **Federation/sign-in failure:** verify the tenant ID, application (client) ID,
+  and the app registration's federated credential against the issuer, subject,
+  and audience supplied by Azure DevOps.
+- **Unexpected subscription ID:** inspect the service connection's configured
+  subscription, rather than changing the GitHub connection.
