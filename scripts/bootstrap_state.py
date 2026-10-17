@@ -14,6 +14,16 @@ import uuid
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "backend.json"
 BLOB_CONTRIBUTOR = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 OWNER_TAG = "aks-terraform-bootstrap"
+AZURE_ERROR_HINTS = {
+    "AuthorizationFailed": "The signed-in identity lacks the required Azure RBAC action.",
+    "RequestDisallowedByAzure": "Azure blocked the request; inspect MFA and policy requirements.",
+    "PrincipalNotFound": "Verify the Enterprise application Object ID and tenant; allow propagation.",
+    "PrincipalTypeNotSupported": "Use the Enterprise application Object ID, not the app registration Object ID.",
+    "RoleAssignmentExists": "A matching assignment already exists; rerun to discover it.",
+    "RoleAssignmentUpdateNotPermitted": "The assignment ID conflicts with an existing assignment.",
+    "RoleDefinitionDoesNotExist": "Verify the role definition is available in this subscription.",
+    "InvalidScope": "Verify the target container resource ID and its existence.",
+}
 FIELDS = {
     "subscription_id", "tenant_id", "location", "environment",
     "resource_group_name", "storage_account_name", "container_name", "key",
@@ -74,8 +84,14 @@ class Azure:
         # Never request keys/tokens or dump CLI responses.
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode:
+            # Only known codes/hints are emitted; raw responses may contain private data.
+            details = " ".join(
+                f"{code}: {hint}" for code, hint in AZURE_ERROR_HINTS.items()
+                if re.search(r"\b" + re.escape(code) + r"\b", result.stderr or "")
+            )
             raise RuntimeError(
                 "Azure CLI failed: " + " ".join(args[:3])
+                + (". " + details if details else "")
                 + ". Check Azure activity logs, MFA, permissions, policy, or RBAC "
                 "propagation before retrying. No rollback was attempted."
             )
@@ -119,6 +135,11 @@ def bootstrap(config, azure, principal):
                                 "--storage-account", name, "--resource-group", rg)
         existing_container = next((item for item in containers if item["name"] == container), None)
         if existing_container:
+            # List responses can omit metadata; validate the full resource instead.
+            existing_container = azure.call(
+                "storage", "container-rm", "show", "--storage-account", name,
+                "--resource-group", rg, "--name", container,
+            )
             metadata = existing_container.get("metadata") or {}
             if (metadata.get("managed_by") != OWNER_TAG
                     or metadata.get("environment") != config["environment"]):
@@ -158,7 +179,8 @@ def bootstrap(config, azure, principal):
     scope = (f"/subscriptions/{config['subscription_id']}/resourceGroups/{rg}"
              f"/providers/Microsoft.Storage/storageAccounts/{name}"
              f"/blobServices/default/containers/{container}")
-    assignments = azure.call("role", "assignment", "list", "--scope", scope, "--all")
+    assignments = azure.call("role", "assignment", "list", "--scope", scope,
+                             "--fill-principal-name", "false")
     assigned = any(
         item.get("principalId", "").lower() == principal
         and item.get("roleDefinitionId", "").lower().endswith("/" + BLOB_CONTRIBUTOR)

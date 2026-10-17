@@ -62,8 +62,14 @@ class FakeAzure:
         if args[:3] == ("storage", "account", "check-name"):
             return {"nameAvailable": self.name_available}
         if args[:3] == ("storage", "container-rm", "list"):
-            return self.containers
+            # Azure's list response can omit metadata even when show returns it.
+            return [{"name": item["name"]} for item in self.containers]
+        if args[:3] == ("storage", "container-rm", "show"):
+            name = args[args.index("--name") + 1]
+            return next(item for item in self.containers if item["name"] == name)
         if args[:3] == ("role", "assignment", "list"):
+            if "--scope" in args and "--all" in args:
+                raise ValueError("Azure CLI does not allow --all with --scope.")
             return self.assignments
         return {}
 
@@ -204,6 +210,13 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(any("create" in c for c in azure.calls))
         self.assertTrue(any("update" in c for c in azure.calls))
 
+    def test_container_metadata_is_read_from_full_resource(self):
+        azure = FakeAzure(self.config, existing=True)
+        bootstrap.bootstrap(self.config, azure, PRINCIPAL)
+        shows = [c for c in azure.calls if c[:3] == ("storage", "container-rm", "show")]
+        self.assertEqual(len(shows), 1)
+        self.assertEqual(shows[0][shows[0].index("--name") + 1], self.config["container_name"])
+
     def test_partial_bootstrap_can_resume(self):
         azure = FakeAzure(self.config, existing=True)
         azure.containers = []
@@ -220,6 +233,13 @@ class BootstrapTests(unittest.TestCase):
             role = next(c for c in azure.calls if c[:3] == ("role", "assignment", "create"))
             names.append(role[role.index("--name") + 1])
         self.assertEqual(names[0], names[1])
+
+    def test_role_lookup_is_scoped_and_skips_graph_name_lookup(self):
+        scope = bootstrap.bootstrap(self.config, self.azure, PRINCIPAL)
+        lookup = next(c for c in self.azure.calls if c[:3] == ("role", "assignment", "list"))
+        self.assertEqual(lookup[lookup.index("--scope") + 1], scope)
+        self.assertNotIn("--all", lookup)
+        self.assertEqual(lookup[lookup.index("--fill-principal-name") + 1], "false")
 
     def test_read_error_is_not_treated_as_missing_resource(self):
         self.azure.call = mock.Mock(side_effect=RuntimeError("Azure unavailable"))
@@ -262,6 +282,18 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--subscription", args[0])
         self.assertEqual(args[0][args[0].index("--subscription") + 1], "test-subscription")
         self.assertFalse(kwargs.get("shell", False))
+
+    @mock.patch.object(bootstrap.subprocess, "run")
+    def test_cli_failure_preserves_known_codes_without_raw_response(self, run):
+        for code in bootstrap.AZURE_ERROR_HINTS:
+            with self.subTest(code=code):
+                run.return_value = subprocess.CompletedProcess(
+                    [], 1, "private stdout", f"ERROR: ({code}) private details",
+                )
+                with self.assertRaises(RuntimeError) as error:
+                    bootstrap.Azure("test-subscription").call("role", "assignment", "create")
+                self.assertIn(code, str(error.exception))
+                self.assertNotIn("private", str(error.exception))
 
     @mock.patch.object(bootstrap.subprocess, "run")
     def test_cli_failure_does_not_dump_responses(self, run):

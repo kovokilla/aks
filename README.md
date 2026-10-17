@@ -145,8 +145,21 @@ This script does not grant subscription Owner/Contributor to the pipeline.
 Find the application used by `azure-service-connection`, then locate its
 **Enterprise application / service principal Object ID** in Microsoft Entra ID.
 Do not substitute the application (client) ID or the app registration Object ID.
-The correct service principal Object ID has not yet been confirmed, so it is a
-required runtime argument rather than a guessed committed value.
+Resolve the service principal from the service connection's application (client)
+ID. The confirmed playground application ID is
+`0b9718f6-7c6e-43de-9e36-d18455c1e8b3`:
+
+```bash
+az ad sp show \
+  --id 0b9718f6-7c6e-43de-9e36-d18455c1e8b3 \
+  --query '{name:displayName,applicationId:appId,principalObjectId:id}' \
+  --output json
+```
+
+Use `principalObjectId` for the bootstrap argument. It remains a runtime value,
+not a guessed committed default. Do not use the app registration Object ID
+`6a8ab55b-33be-4271-861e-f12b7ae132ca`: Azure identified that object as an
+Application, which cannot receive Azure RBAC assignments.
 
 ### Preview, authenticate, and explicitly bootstrap
 
@@ -167,18 +180,21 @@ required runtime argument rather than a guessed committed value.
    az account set --subscription 2c209a53-b9e9-4c5e-8ecf-217c5889ecd7
    ```
 
-3. Read the service principal Object ID interactively, then explicitly apply:
+3. Resolve the correct service principal Object ID and explicitly apply:
 
    ```bash
-   read -r PIPELINE_PRINCIPAL_OBJECT_ID
+   PIPELINE_PRINCIPAL_OBJECT_ID=$(az ad sp show \
+     --id 0b9718f6-7c6e-43de-9e36-d18455c1e8b3 \
+     --query id --output tsv) &&
    python3 scripts/bootstrap_state.py \
      --apply \
      --confirm-subscription 2c209a53-b9e9-4c5e-8ecf-217c5889ecd7 \
      --pipeline-principal-object-id "$PIPELINE_PRINCIPAL_OBJECT_ID"
    ```
 
-   Paste the nonsecret Object ID at the `read` prompt. The script verifies the
-   target subscription, tenant, and enabled status before making changes.
+   The `&&` prevents bootstrap if the lookup fails; the script also rejects an
+   empty or invalid Object ID. It verifies the target subscription, tenant,
+   and enabled status before making changes.
    Every CLI request explicitly targets the configured subscription.
 
 ### What bootstrap creates and protects
@@ -206,6 +222,25 @@ Do not run multiple bootstrap instances concurrently.
 Errors can leave partially created state-storage resources. There is deliberately
 no automatic destructive rollback; inspect Azure activity logs, fix the cause,
 and rerun with the same configuration. No `fitxmatt` resources are targeted.
+
+### Issues found and fixed during Cloud Shell testing
+
+- Azure CLI rejects combining `role assignment list --scope` with `--all`.
+  Listing now uses the container scope without `--all`, and disables unnecessary
+  principal-name lookups through Microsoft Graph.
+- Container list responses omitted ownership metadata even though the container
+  had it. Reruns now read the full container with `container-rm show` before
+  checking ownership. The ownership guard is preserved.
+- `PrincipalTypeNotSupported` identified an app registration Object ID passed
+  instead of its service principal Object ID. Resolve the Enterprise application
+  from its application (client) ID as shown above; this is not an MFA failure.
+- Known Azure error codes now have safe diagnostic hints in the wrapper.
+  Raw CLI stdout/stderr, credentials, and tokens are not dumped.
+
+Regression tests cover the CLI argument combination and list/detail response
+difference. On an older Cloud Shell checkout with manual edits, do not blindly
+discard them or pull over them: compare changes with Git first. A fresh clone of
+the published branch includes these fixes without manual patches.
 
 ### Expected result and backend handoff
 
@@ -239,11 +274,32 @@ guards, security flags, ownership/collision checks, resumable bootstrap, scoped
 RBAC, and credential-free CLI construction using faked responses.
 These tests do **not** establish that Azure permissions or names are valid.
 
-Local validation: all 21 offline unit tests passed, preview/backend rendering
-worked, and whitespace checks passed. No Azure bootstrap or pipeline run was
-performed, and no storage-name availability check was made. Remaining manual
-actions: confirm the pipeline principal Object ID, review permissions, and run
-bootstrap when authorized.
+Local validation: all 24 offline unit tests passed, preview/backend rendering
+worked, and whitespace checks passed. The subscription checker is unchanged.
+
+### Live validation record — 2026-10-17
+
+The operator ran bootstrap in Azure Cloud Shell against the configured
+subscription/tenant, applied the CLI/metadata fixes above, resolved the service
+principal correctly, and reported successful completion:
+
+```text
+State storage configured. Container scope: /subscriptions/2c209a53-b9e9-4c5e-8ecf-217c5889ecd7/resourceGroups/aks-tfstate-rg/providers/Microsoft.Storage/storageAccounts/akstfstate2c209a53/blobServices/default/containers/tfstate
+Terraform creates the state blob on its first state write. Allow time for RBAC propagation.
+```
+
+A read-only container query supplied by the operator also showed
+`publicAccess: None` and matching `managed_by: aks-terraform-bootstrap` /
+`environment: aks-sandbox` metadata. Successful bootstrap means its storage
+configuration and role-assignment commands completed without an error.
+This evidence was supplied from Cloud Shell, not independently collected from
+the local development machine.
+
+Remaining verification: independently read back the account's HTTPS/TLS/shared-key
+settings and blob versioning/retention, and test blob-data access using the
+pipeline identity after RBAC propagation. Human Owner access alone does not prove
+pipeline data-plane access. Terraform has not been run and there is no verified
+Terraform state blob yet. No AKS/ACR create or destroy operation was performed.
 
 Subsequent commits will add the Terraform sandbox, shared pipeline tooling,
 manual creation pipeline, guarded destruction pipeline, and the final lifecycle
