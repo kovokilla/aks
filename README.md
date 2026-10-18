@@ -670,6 +670,13 @@ Have sufficient hosted parallel-job capacity and time allowance before applying.
   environment and connection; do not select the checker YAML by mistake.
 - **Environment-check API 401/403:** check Build Service environment/check read
   permissions and job OAuth mapping. This is separate from Azure IAM.
+- **Both checks are visible but the guard rejects them:** use the latest branch
+  and start a new run, not just a failed-job retry. The guard recognizes
+  `Approval`/`Approvals`, the stable approval check type ID, and spaced/unspaced
+  `Exclusive Lock` labels. Its diagnostic reports missing check types and
+  scope/disabled/error flags without dumping the API response. UI labels alone
+  do not establish what the API returned; share the new diagnostic if it persists.
+  `Lock not in use` on an idle environment is normal, not a disabled lock.
 - **OIDC missing/invalid:** the connection must use workload federation, not a
   GitHub connection or client-secret connection. Required OAuth/request URI
   variables and the task-provided service connection ID must be available.
@@ -687,9 +694,12 @@ Have sufficient hosted parallel-job capacity and time allowance before applying.
 ### Validation record
 
 Local validation covers both YAML files' syntax and plan-only/provisioning job
-structure, Bash syntax, all 66 offline Python tests, and the existing Terraform
+structure, Bash syntax, all 68 offline Python tests, and the existing Terraform
 format/schema checks and five targeted mock tests. The unchanged subscription
-checker is preserved. Azure DevOps server-side template compilation, environment
-checks, native federation, the full real plan, and provisioning have **not** been
-executed. No Azure resources were modified while implementing this pipeline.
+checker is preserved. The first operator-reported Azure DevOps run reached the
+environment preflight and stopped there; a subsequent screenshot showed both
+checks configured. Label compatibility and safe diagnostics were improved, but
+that update still needs a new run. Native federation, backend initialization,
+the full real plan, and provisioning remain unverified. No Azure resources were
+modified while implementing this pipeline.
 The next live action should be a **plan-only** run, not an apply.

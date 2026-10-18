@@ -34,6 +34,30 @@ def configuration():
 class EnvironmentChecksTests(unittest.TestCase):
     def test_expected_checks(self):
         checks.require_checks(configuration(), "42")
+    def test_approval_label_variants_and_stable_id(self):
+        for name, identifier in (
+            ("Approvals", ""), ("APPROVALS", ""),
+            ("", "8c6f20a7-a545-4486-9777-f762fafe0d4d"),
+        ):
+            with self.subTest(name=name):
+                data = configuration()
+                data["value"][0]["type"] = {"name": name, "id": identifier}
+                data["value"][1]["type"]["name"] = "Exclusive Lock"
+                data["value"][1]["resource"]["id"] = 42
+                checks.require_checks(data, "42")
+
+    def test_error_identifies_missing_checks_without_raw_api_data(self):
+        data = configuration()
+        data["value"][1]["isDisabled"] = True
+        data["value"][1]["private_response_marker"] = "must-not-be-logged"
+        with self.assertRaises(ValueError) as error:
+            checks.require_checks(data, "42")
+        message = str(error.exception)
+        self.assertIn("Exclusive lock", message)
+        self.assertIn("disabled=True", message)
+        self.assertNotIn("must-not-be-logged", message)
+        with self.assertRaisesRegex(ValueError, "Observed API check types: none"):
+            checks.require_checks({"value": []}, "42")
 
     def test_missing_disabled_wrong_resource_and_error_checks_fail(self):
         for mutation in ("missing", "disabled", "wrong_resource", "issue"):

@@ -36,16 +36,31 @@ def checks_url(env):
 
 def require_checks(document, environment_id):
     enabled = set()
+    observed = []
     for check in document.get("value", []):
-        resource = check.get("resource", {})
-        if (resource.get("type", "").lower() != "environment"
-                or str(resource.get("id")) != environment_id
-                or check.get("isDisabled", False)
-                or (check.get("issue") or {}).get("type") == "error"):
+        resource = check.get("resource") or {}
+        check_type = check.get("type") or {}
+        kind = re.sub("[^a-z]", "", check_type.get("name", "").lower())
+        # UI/API versions can use either Approval or Approvals.
+        if kind == "approvals" or check_type.get("id", "").lower() == "8c6f20a7-a545-4486-9777-f762fafe0d4d":
+            kind = "approval"
+        matches = (resource.get("type", "").lower() == "environment"
+                   and str(resource.get("id")) == environment_id)
+        disabled = bool(check.get("isDisabled", False))
+        issue = str((check.get("issue") or {}).get("type", "")).lower() == "error"
+        # Only type labels/flags are reported, never complete API responses.
+        observed.append(f"{kind[:48] or 'unknown'}(scopeMatch={matches},disabled={disabled},issue={issue})")
+        if not matches or disabled or issue:
             continue
-        enabled.add(re.sub("[^a-z]", "", check.get("type", {}).get("name", "").lower()))
-    if not {"approval", "exclusivelock"}.issubset(enabled):
-        raise ValueError("The environment needs enabled Approval and Exclusive lock checks.")
+        enabled.add(kind)
+    required = {"approval": "Approval", "exclusivelock": "Exclusive lock"}
+    missing = [label for kind, label in required.items() if kind not in enabled]
+    if missing:
+        raise ValueError(
+            f"Environment {environment_id} is missing enabled checks: {', '.join(missing)}. "
+            f"Observed API check types: {'; '.join(observed[:20]) or 'none'}. "
+            "Start a new run after saving environment checks; do not retry only the failed job."
+        )
 
 
 def read_json(url, token):
