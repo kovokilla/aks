@@ -268,8 +268,9 @@ python3 scripts/bootstrap_state.py --print-backend-config > config/backend.local
 ```
 
 The generated file is ignored. It enables Entra data-plane authentication and
-native OIDC for future pipeline use. The backend declaration is in
-`terraform/backend.tf`; federated pipeline identity/token wiring is still pending.
+native OIDC for pipeline use. The backend declaration is in
+`terraform/backend.tf`; the shared pipeline runner supplies federated identity
+and token-request configuration.
 For a human Cloud Shell login, use the CLI-authenticated initializer in step 2
 instead. Blob leases provide state locking once the backend is used.
 Never commit state or saved plans: they may contain sensitive values.
@@ -314,10 +315,10 @@ HTTPS-only `true`, minimum TLS `TLS1_2`, public blob access `false`, shared-key
 authentication `false`, versioning `true`, and enabled 14-day blob/container soft
 delete. This confirms the storage configuration through operator-provided evidence.
 
-Remaining verification: backend initialization and blob-data access using the
-pipeline identity. Human Owner access alone does not prove pipeline data-plane
-access. No live Terraform initialization, plan, apply, or destroy has been
-verified, and there is no verified Terraform state blob yet.
+Subsequent pipeline backend initialization, plan, and normal state-lock operation
+succeeded on 2026-10-18 using the pipeline identity; see the step 4 live record.
+Human Owner access alone would not have proved pipeline data-plane access.
+No apply, destroy, state recovery, or deployed sandbox has yet been verified.
 
 Shared pipeline tooling and the creation pipeline are documented below.
 The guarded destruction pipeline remains a separate future step. Each commit
@@ -464,15 +465,17 @@ to avoid AzureRM's generated kubelet-identity block, which generic mocks do not
 reproduce. They check sandbox naming, VMSS settings, ACR/local-account security,
 node count, and group isolation. They do **not** validate the full RBAC graph or
 contact Azure. Provider-schema validation covers all declared resource arguments.
-The real Azure DevOps plan is still needed for the complete graph and Azure
-permissions. Test teardown refers only to mock state, not live resources.
+The real Azure DevOps plan covers the complete graph, unlike these targeted
+mocks; its subsequent successful run is recorded in step 4. Planning does not
+prove resource-creation permissions or Azure capacity. Test teardown refers
+only to mock state, not live resources.
 
 Local results: Terraform formatting and schema validation passed; all five
 targeted Terraform tests and all 37 Python unit tests passed. Provider packages
 were downloaded from HashiCorp and their signed registry checksums locked.
-Local initialization used `-backend=false` only. Live backend initialization
-remains pending operator output from Cloud Shell; no successful Azure init,
-live plan, apply, or destroy is claimed.
+Local initialization used `-backend=false` only. At that configuration commit,
+live initialization and plan were still pending. The later Azure DevOps success
+is recorded in step 4; no Cloud Shell init, apply, or destroy success is claimed.
 
 ## Infrastructure lifecycle: step 3 — Azure DevOps Terraform tooling
 
@@ -578,9 +581,9 @@ pipeline and its credentials.
 Local validation for this step uses synthetic Azure DevOps responses, synthetic
 Terraform plans, and mocked subprocesses, with no Azure requests. Tests cover
 private-project/context checks, OIDC selection, version and provider preflight,
-scope/delete guards, artifact tampering, and saved-plan-only apply. Actual Azure
-DevOps YAML compilation and service-connection access remain unverified until
-the pipeline is registered and run.
+scope/delete guards, artifact tampering, and saved-plan-only apply. At that
+tooling commit, actual Azure DevOps compilation and service-connection access
+were unverified; the later plan-only execution is recorded in step 4.
 All 65 Python unit tests and whitespace checks passed for this tooling commit.
 This is the historical tooling-commit count; the revised context-preflight tests
 and current full-suite count are recorded in step 4.
@@ -626,8 +629,8 @@ Approve the environment's stage-level check when prompted. The plan job then:
    Terraform plan, then validates its sandbox-only changes.
 
 This first run verifies backend initialization using the **pipeline identity**
-instead of your Cloud Shell user. Success is not claimed until actual run logs
-are available. The plan acquires/releases backend state locking as part of
+instead of your Cloud Shell user. The successful operator-supplied run logs are
+recorded below. The plan acquires/releases backend state locking as part of
 Terraform's operation, but the pipeline does not conduct a separate contention
 test. No application/AKS deployment is performed in plan-only mode.
 No plan artifact is published in this mode; inspect the protected run's plan log.
@@ -721,7 +724,37 @@ Reader access was made explicit. The redundant probe was removed; private-projec
 and sandbox-context checks, native environment references, sequential lock mode,
 post-plan manual approval, and saved-plan safeguards are preserved.
 Obsolete API-parser tests were replaced with context and native-gate wiring tests.
-This revision still needs a new plan-only run. Native federation, backend initialization,
-the full real plan, and provisioning remain unverified. No Azure resources were
-modified while implementing this pipeline.
-The next live action should be a **plan-only** run, not an apply.
+
+### Live plan-only validation — 2026-10-18
+
+After the revised preflight, the operator supplied this successful Azure DevOps
+Terraform task output:
+
+```text
+Plan: 4 to add, 0 to change, 0 to destroy.
+Releasing state lock. This may take a few moments...
+Terraform version check passed: 1.13.3
+Sandbox-only plan validated; review the Terraform plan log before approving.
+Finishing: Terraform plan with federated Azure authentication
+```
+
+The planned outputs matched `aks-sandbox`, `aks-sandbox-nodes-rg`, and
+`aks-sandbox-rg`; the ACR login server remains known only after apply.
+This verifies the plan-only pipeline path: the pinned version check, native
+federated authentication, existing Azure backend initialization/access, schema
+validation, full four-resource plan, sandbox guards, and normal state-lock
+acquisition/release completed. This is operator-provided log evidence, not an
+independently queried Azure inventory or run API result. No run URL was supplied.
+
+**Nothing was provisioned by this plan-only run.** Four additions are proposed,
+not existing deployed resources. No changes/deletions were planned, and no
+apply/destroy was executed as part of this validation.
+Successful planning does not prove apply-time provisioning/role-assignment
+permissions, SKU/quota/name availability, lease contention handling, token refresh
+over a long deployment, or state recovery. The provisioning artifact/review/apply
+path and separate destruction pipeline remain unverified.
+
+When explicitly ready to incur sandbox charges, start a new run with
+`provisionResources = true`, confirm `aks-sandbox`, and review that new run's plan
+before approving it. The previously completed plan-only run is not an apply
+authorization and is not automatically reused.
