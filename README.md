@@ -15,8 +15,8 @@ The separate destruction pipeline is not yet added.
 - `scripts/bootstrap_state.py`: guarded, one-time Azure state-storage bootstrap.
 - `scripts/init_backend.py`: initialize the Azure backend with a human CLI login.
 - `scripts/install_terraform.py`: checksum-verified pinned Terraform installation.
-- `scripts/check_pipeline_environment.py`: read-only verification of Azure DevOps
-  environment approval and locking checks.
+- `scripts/check_pipeline_environment.py`: read-only private-project and sandbox
+  context validation; native Azure DevOps controls enforce environment gates.
 - `scripts/pipeline_terraform.py`: guarded native-OIDC runner for saved-plan
   creation/application by Azure DevOps.
 - `terraform/`: sandbox resources, remote backend declaration, inputs, outputs,
@@ -518,17 +518,26 @@ are separate from Azure RBAC.
 
 Create **Pipelines → Environments → `aks-sandbox`** before the first pipeline run.
 Add enabled **Approval** and **Exclusive lock** checks under **Approvals and
-checks**. Authorize the intended pipeline to use the environment. Grant the
-project Build Service identity read access to its environment/check configuration
-so the job's OAuth token can query it.
+checks**. Authorize the intended pipeline to use the environment. The job OAuth
+token needs project-metadata read access, but no check-configuration introspection
+permission is required.
 
-The checker script uses a GET request to require a private Azure DevOps project
-and a documented read-only `POST .../checks/queryconfigurations` request with an
-explicit environment resource reference to retrieve its checks. It refuses
-to proceed if either required check is absent, disabled, invalid, or unreadable.
-It does not create checks, bypass them, or change permissions.
-Checks are configured outside YAML; the YAML alone cannot create an approval
-or lock. The create pipeline uses `lockBehavior: sequential` and one stage
+Azure DevOps natively evaluates the environment's configured approvals and checks
+before its consuming stage starts. These controls belong to the resource owner,
+not the agent script. Keep both checks enabled and review their status on the
+run's stage **Checks** panel. See Microsoft's
+[approvals and checks documentation](https://learn.microsoft.com/en-us/azure/devops/pipelines/process/approvals?view=azure-devops).
+
+The agent preflight only validates the expected sandbox environment name,
+positive environment ID, matching project ID, and private project visibility.
+It does **not** audit check presence or claim that a checks API response proves
+enforcement. Owners must retain the native checks; if an owner removes them,
+the script will not detect that configuration change. Post-plan ManualValidation,
+explicit confirmation, saved-plan guards, and backend locking still remain.
+The script never creates, disables, or bypasses native checks.
+
+Checks are configured outside YAML; YAML alone cannot create an approval or lock.
+The create pipeline uses `lockBehavior: sequential` and one stage
 to keep the environment lock through plan, review, and apply. Other lifecycle
 pipelines must use that same environment; manual Terraform commands do not
 participate in this whole-run lock. Backend blob locking is an additional layer.
@@ -568,18 +577,20 @@ pipeline and its credentials.
 
 Local validation for this step uses synthetic Azure DevOps responses, synthetic
 Terraform plans, and mocked subprocesses, with no Azure requests. Tests cover
-missing checks/permissions, OIDC selection, version and provider preflight,
+private-project/context checks, OIDC selection, version and provider preflight,
 scope/delete guards, artifact tampering, and saved-plan-only apply. Actual Azure
 DevOps YAML compilation and service-connection access remain unverified until
 the pipeline is registered and run.
 All 65 Python unit tests and whitespace checks passed for this tooling commit.
+This is the historical tooling-commit count; the revised context-preflight tests
+and current full-suite count are recorded in step 4.
 
 ## Infrastructure lifecycle: step 4 — manual provisioning pipeline
 
 ### One-time Azure DevOps setup
 
 1. Configure the `aks-sandbox` Azure DevOps environment, enabled Approval and
-   Exclusive lock checks, and Build Service read access described in step 3.
+   Exclusive lock checks, and project read access described in step 3.
    These are Azure DevOps controls, not Azure resources.
 2. Confirm that the workload-federated `azure-service-connection` has the Azure
    data-plane, provisioning, and role-assignment permissions listed in step 3.
@@ -604,8 +615,9 @@ Approve the environment's stage-level check when prompted. The plan job then:
 
 1. Installs checksum-verified Terraform **1.13.3** on the hosted Linux agent and
    displays its version. It does not rely on the agent's preinstalled version.
-2. Verifies enabled environment Approval and Exclusive lock checks through the
-   Azure DevOps API; missing checks/read permissions stop execution.
+2. Verifies the private project ID/visibility and sandbox deployment context.
+   Azure DevOps has already evaluated the owner-configured native checks before
+   the stage starts; the agent does not query the checks configuration API.
 3. Signs in through `AzureCLI@2`, verifies the expected subscription, tenant,
    application, Terraform version, and registered Azure providers.
 4. Uses native refreshable workload federation to initialize the **existing**
@@ -636,7 +648,7 @@ Once the plan-only run succeeds and you are ready for Azure charges:
    permission holders may review and self-approval is explicitly allowed.
    Use explicit independent approvers and branch protection for production.
 5. After approval, the apply deployment job installs the same Terraform version,
-   rechecks environment controls, downloads the artifact from this run only,
+   rechecks private-project/sandbox context, downloads the artifact from this run only,
    initializes the same backend, validates artifact/source/run/identity binding
    and plan scope, then applies the exact reviewed binary plan.
 
@@ -669,23 +681,19 @@ Have sufficient hosted parallel-job capacity and time allowance before applying.
 
 - **Missing environment/permission prompt:** create/authorize the correct
   environment and connection; do not select the checker YAML by mistake.
-- **Environment-check API 401/403:** check Build Service environment/check read
-  permissions and job OAuth mapping. This is separate from Azure IAM.
-- **Both checks are visible but the guard rejects them:** use the latest branch
-  and start a new run, not just a failed-job retry. The guard recognizes
-  `Approval`/`Approvals`, the stable approval check type ID, and spaced/unspaced
-  `Exclusive Lock` labels. Its diagnostic reports missing check types and
-  scope/disabled/error flags without dumping the API response. UI labels alone
-  do not establish what the API returned; share the new diagnostic if it persists.
+- **Project-metadata API 401/403:** check project read access and job OAuth mapping.
+  This is separate from Azure IAM. Do not grant Administrator or a PAT merely
+  to inspect environment check configuration.
+- **Old "Observed API check types: none" error:** use the latest branch and start
+  a new run. That custom checks-API probe was removed after repeated empty
+  responses despite the UI showing both checks and explicit Reader access.
+  The cause of those empty responses was not conclusively established. This is
+  not an empty-response-as-success fallback: check introspection is no longer
+  performed, and actual enforcement remains Azure DevOps's responsibility.
+- **No native approval/lock visible on the stage:** stop before provisioning and
+  verify owner-configured enabled checks on the `aks-sandbox` environment and
+  both deployment jobs' environment references. Do not disable the native checks.
   `Lock not in use` on an idle environment is normal, not a disabled lock.
-- **Observed API check types: none:** the initial filtered GET returned no checks
-  even though the operator's UI showed them. The guard now uses the documented
-  resource-reference query endpoint with environment type, ID, and name.
-  This POST only reads configuration; it does not create or alter checks.
-  If the explicit query is also empty, compare the reported project/environment
-  with the UI and grant the project Build Service access to read the environment
-  and its check configuration. Browser-admin visibility does not prove job-token
-  visibility. No empty or unexpected response bypasses either guard.
 - **OIDC missing/invalid:** the connection must use workload federation, not a
   GitHub connection or client-secret connection. Required OAuth/request URI
   variables and the task-provided service connection ID must be available.
@@ -703,14 +711,17 @@ Have sufficient hosted parallel-job capacity and time allowance before applying.
 ### Validation record
 
 Local validation covers both YAML files' syntax and plan-only/provisioning job
-structure, Bash syntax, all 71 offline Python tests, and the existing Terraform
+structure, Bash syntax, all 66 offline Python tests, and the existing Terraform
 format/schema checks and five targeted mock tests. The unchanged subscription
 checker is preserved. The first operator-reported Azure DevOps run reached the
 environment preflight and stopped there; a subsequent screenshot showed both
 checks configured. Label compatibility and safe diagnostics were improved, but
-an updated run then reported an empty checks response. The explicit resource
-query and permission-context diagnostics still need a new live run.
-Native federation, backend initialization,
+updated runs then reported empty responses from both documented APIs even after
+Reader access was made explicit. The redundant probe was removed; private-project
+and sandbox-context checks, native environment references, sequential lock mode,
+post-plan manual approval, and saved-plan safeguards are preserved.
+Obsolete API-parser tests were replaced with context and native-gate wiring tests.
+This revision still needs a new plan-only run. Native federation, backend initialization,
 the full real plan, and provisioning remain unverified. No Azure resources were
 modified while implementing this pipeline.
 The next live action should be a **plan-only** run, not an apply.

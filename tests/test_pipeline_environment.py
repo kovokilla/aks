@@ -1,5 +1,6 @@
-"""Azure DevOps API checks are tested with synthetic responses; no network."""
+"""Private-project/context checks are mocked; native deployment gates stay in YAML."""
 
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -9,7 +10,8 @@ from unittest import mock
 import urllib.error
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 import check_pipeline_environment as checks
 
 
@@ -22,112 +24,56 @@ def environment():
     }
 
 
-def configuration():
-    return {"value": [
-        {"resource": {"type": "environment", "id": "42"},
-         "type": {"name": "Approval"}, "isDisabled": False, "issue": None},
-        {"resource": {"type": "environment", "id": "42"},
-         "type": {"name": "ExclusiveLock"}, "isDisabled": False},
-    ]}
+def project(visibility="private"):
+    return {"id": environment()["SYSTEM_TEAMPROJECTID"], "visibility": visibility}
 
 
-class EnvironmentChecksTests(unittest.TestCase):
-    def test_expected_checks(self):
-        checks.require_checks(configuration(), "42")
-    def test_unwrapped_response_supported(self):
-        checks.require_checks(configuration()["value"], "42")
-
-    def test_unexpected_response_shape_is_not_treated_as_empty(self):
-        with self.assertRaisesRegex(ValueError, "response shape"):
-            checks.require_checks({"unexpected": []}, "42")
-    def test_approval_label_variants_and_stable_id(self):
-        for name, identifier in (
-            ("Approvals", ""), ("APPROVALS", ""),
-            ("", "8c6f20a7-a545-4486-9777-f762fafe0d4d"),
-        ):
-            with self.subTest(name=name):
-                data = configuration()
-                data["value"][0]["type"] = {"name": name, "id": identifier}
-                data["value"][1]["type"]["name"] = "Exclusive Lock"
-                data["value"][1]["resource"]["id"] = 42
-                checks.require_checks(data, "42")
-
-    def test_error_identifies_missing_checks_without_raw_api_data(self):
-        data = configuration()
-        data["value"][1]["isDisabled"] = True
-        data["value"][1]["private_response_marker"] = "must-not-be-logged"
-        with self.assertRaises(ValueError) as error:
-            checks.require_checks(data, "42")
-        message = str(error.exception)
-        self.assertIn("Exclusive lock", message)
-        self.assertIn("disabled=True", message)
-        self.assertNotIn("must-not-be-logged", message)
-        with self.assertRaisesRegex(ValueError, "Observed API check types: none"):
-            checks.require_checks({"value": []}, "42")
-
-    def test_missing_disabled_wrong_resource_and_error_checks_fail(self):
-        for mutation in ("missing", "disabled", "wrong_resource", "issue"):
-            with self.subTest(mutation=mutation):
-                data = configuration()
-                if mutation == "missing":
-                    data["value"].pop()
-                elif mutation == "disabled":
-                    data["value"][1]["isDisabled"] = True
-                elif mutation == "wrong_resource":
-                    data["value"][1]["resource"]["id"] = "99"
-                else:
-                    data["value"][1]["issue"] = {"type": "error"}
-                with self.assertRaises(ValueError):
-                    checks.require_checks(data, "42")
-
-    def test_official_resource_query_endpoint(self):
-        url = checks.checks_url(environment())
-        self.assertTrue(url.startswith("https://dev.azure.com/example/"))
-        self.assertIn("/_apis/pipelines/checks/queryconfigurations?", url)
-        self.assertIn("api-version=7.1-preview.1", url)
+class EnvironmentContextTests(unittest.TestCase):
+    def test_official_project_endpoint(self):
+        url = checks.project_url(environment())
+        self.assertEqual(url, "https://dev.azure.com/example/_apis/projects/"
+                         + environment()["SYSTEM_TEAMPROJECTID"] + "?api-version=7.1")
 
     def test_untrusted_url_or_bad_environment_id_rejected(self):
         for key, value in (
             ("SYSTEM_COLLECTIONURI", "https://attacker.invalid/"),
             ("SYSTEM_COLLECTIONURI", "http://dev.azure.com/example/"),
-            ("ENVIRONMENT_ID", "$(Environment.Id)"),
+            ("ENVIRONMENT_ID", "$(Environment.Id)"), ("ENVIRONMENT_ID", "0"),
+            ("SYSTEM_TEAMPROJECTID", "not-a-project-id"),
         ):
-            env = environment()
-            env[key] = value
-            with self.assertRaises(ValueError):
-                checks.checks_url(env)
+            with self.subTest(key=key, value=value):
+                env = environment()
+                env[key] = value
+                with self.assertRaises(ValueError):
+                    checks.project_url(env)
 
     @mock.patch.object(checks.urllib.request, "build_opener")
-    def test_read_only_verification(self, build_opener):
-        build_opener.return_value.open.side_effect = [
-            io.BytesIO(b'{"visibility":"private"}'),
-            io.BytesIO(json.dumps(configuration()).encode()),
-        ]
-        checks.verify(environment())
+    def test_preflight_reads_only_project_metadata_not_check_configuration(self, build_opener):
+        build_opener.return_value.open.return_value = io.BytesIO(json.dumps(project()).encode())
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            checks.verify(environment())
         request = build_opener.return_value.open.call_args.args[0]
-        self.assertEqual(request.get_method(), "POST")
-        self.assertEqual(json.loads(request.data), [{
-            "type": "environment", "id": "42", "name": "aks-sandbox",
-        }])
-        first = build_opener.return_value.open.call_args_list[0].args[0]
-        self.assertEqual(first.get_method(), "GET")
-    @mock.patch.object(checks.urllib.request, "build_opener")
-    def test_empty_query_reports_project_and_job_token_visibility(self, build_opener):
-        build_opener.return_value.open.side_effect = [
-            io.BytesIO(b'{"visibility":"private"}'),
-            io.BytesIO(b'{"count":0,"value":[]}'),
-        ]
-        with self.assertRaises(ValueError) as error:
-            checks.verify(environment())
-        self.assertIn(environment()["SYSTEM_TEAMPROJECTID"], str(error.exception))
-        self.assertIn("Build Service", str(error.exception))
-        self.assertNotIn(environment()["SYSTEM_ACCESSTOKEN"], str(error.exception))
-    @mock.patch.object(checks.urllib.request, "build_opener")
-    def test_public_project_rejected_before_check_or_artifact_access(self, build_opener):
-        build_opener.return_value.open.return_value = io.BytesIO(b'{"visibility":"public"}')
-        with self.assertRaisesRegex(ValueError, "private Azure DevOps project"):
-            checks.verify(environment())
+        self.assertEqual(request.get_method(), "GET")
+        self.assertIn("/_apis/projects/", request.full_url)
+        self.assertNotIn("/checks/", request.full_url)
         self.assertEqual(build_opener.return_value.open.call_count, 1)
+        self.assertIn("does not audit check presence", output.getvalue())
+        self.assertNotIn("Verified enabled Approval", output.getvalue())
+
+    @mock.patch.object(checks.urllib.request, "build_opener")
+    def test_public_or_missing_visibility_rejected(self, build_opener):
+        for value in ("public", None):
+            build_opener.return_value.open.return_value = io.BytesIO(json.dumps(project(value)).encode())
+            with self.assertRaisesRegex(ValueError, "private Azure DevOps project"):
+                checks.verify(environment())
+
+    @mock.patch.object(checks.urllib.request, "build_opener")
+    def test_mismatched_or_malformed_project_rejected(self, build_opener):
+        for document in ({"id": "other", "visibility": "private"}, {"id": None},
+                         {"id": 42}, {}, [], None):
+            build_opener.return_value.open.return_value = io.BytesIO(json.dumps(document).encode())
+            with self.assertRaisesRegex(ValueError, "project response"):
+                checks.verify(environment())
 
     @mock.patch.object(checks.urllib.request, "build_opener")
     def test_missing_token_and_wrong_environment_fail_without_network(self, build_opener):
@@ -148,6 +94,17 @@ class EnvironmentChecksTests(unittest.TestCase):
     def test_redirects_rejected(self):
         with self.assertRaises(ValueError):
             checks.NoRedirect().redirect_request(None, None, 302, "", {}, "https://attacker.invalid")
+
+    def test_native_gate_and_saved_plan_pipeline_contract_is_retained(self):
+        pipeline = (ROOT / "azure-pipelines-create.yml").read_text()
+        self.assertEqual(pipeline.count("environment: aks-sandbox"), 2)
+        for required in ("lockBehavior: sequential", "task: ManualValidation@1", "pool: server",
+                         "onTimeout: reject", "dependsOn: ReviewPlan", "default: false"):
+            self.assertIn(required, pipeline)
+        template = (ROOT / "pipelines/templates/terraform-job-steps.yml").read_text()
+        self.assertIn("Verify private project and sandbox environment context", template)
+        self.assertIn("buildType: current", template)
+        self.assertIn("artifactName: sandbox-plan", template)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ steps:
 
 - bash: python3 scripts/check_pipeline_environment.py
   workingDirectory: $(Build.SourcesDirectory)
-  displayName: Require environment approval and exclusive lock checks
+  displayName: Verify private project and sandbox environment context
   env:
     SYSTEM_ACCESSTOKEN: $(System.AccessToken)
     SYSTEM_COLLECTIONURI: $(System.CollectionUri)
