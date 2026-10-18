@@ -11,6 +11,10 @@ configuration are implemented. Automated create/destroy pipelines are not yet ad
 - `scripts/bootstrap_state.py`: guarded, one-time Azure state-storage bootstrap.
 - `scripts/init_backend.py`: initialize the Azure backend with a human CLI login.
 - `scripts/install_terraform.py`: checksum-verified pinned Terraform installation.
+- `scripts/check_pipeline_environment.py`: read-only verification of Azure DevOps
+  environment approval and locking checks.
+- `scripts/pipeline_terraform.py`: guarded native-OIDC runner for saved-plan
+  creation/application by the forthcoming Azure DevOps pipeline.
 - `terraform/`: sandbox resources, remote backend declaration, inputs, outputs,
   signed provider lockfile, and targeted mock-plan tests.
 - `tests/`: offline bootstrap, backend initialization, and installer unit tests.
@@ -465,3 +469,101 @@ were downloaded from HashiCorp and their signed registry checksums locked.
 Local initialization used `-backend=false` only. Live backend initialization
 remains pending operator output from Cloud Shell; no successful Azure init,
 live plan, apply, or destroy is claimed.
+
+## Infrastructure lifecycle: step 3 — Azure DevOps Terraform tooling
+
+The recommended path is now Azure DevOps rather than a human Cloud Shell login.
+The Cloud Shell initializer remains an optional diagnostic. Pipeline YAML is
+added in step 4; this step supplies its shared runner and safety checks.
+
+### Pipeline identity and authentication
+
+The runner must execute inside `AzureCLI@2` using `azure-service-connection`,
+with workload identity federation and `addSpnToEnvironment: true`. It checks the
+task's subscription, tenant, and application ID against its authenticated CLI
+context, then selects native OIDC for both Terraform and its backend.
+It uses the Azure DevOps OIDC request endpoint, job OAuth token, and service
+connection ID so Terraform can request fresh assertions during longer operations.
+The task's initial static `idToken` is not used for Terraform authentication.
+
+The job OAuth token is mapped only through environment variables; it is never
+written into backend configuration, Git, logs, or artifacts. Service connection
+client secrets, inherited ARM credentials, Terraform variable/CLI overrides,
+debug logging, and nondefault workspaces are not used. The configured versions
+support `ARM_OIDC_AZURE_SERVICE_CONNECTION_ID` and native token refresh.
+
+An administrator must authorize this pipeline for the Azure Resource Manager
+connection and grant the pipeline identity:
+
+- `Storage Blob Data Contributor` on the existing `tfstate` container (the
+  successful bootstrap granted this to the chosen service principal).
+- Resource-management permissions for the new sandbox. Since Terraform creates
+  its resource group, subscription-level Contributor is a straightforward
+  **playground** setup, but broader than a production least-privilege design.
+- Permission to assign/remove `AcrPull`, for example a suitably scoped/conditioned
+  Role Based Access Control Administrator assignment. Contributor alone cannot
+  create that assignment. Do not grant Owner simply to resolve an error.
+- Read permission on provider registrations; required resource providers must
+  already be registered. The runner checks them but never registers them.
+
+These roles must be granted to the **Enterprise application**, not the app
+registration. Azure DevOps environment permissions and job OAuth permissions
+are separate from Azure RBAC.
+
+### Azure DevOps environment prerequisites
+
+Create **Pipelines → Environments → `aks-sandbox`** before the first pipeline run.
+Add enabled **Approval** and **Exclusive lock** checks under **Approvals and
+checks**. Authorize the intended pipeline to use the environment. Grant the
+project Build Service identity read access to its environment/check configuration
+so the job's OAuth token can query it.
+
+The checker script uses a GET request to Azure DevOps's checks API and refuses
+to proceed if either required check is absent, disabled, invalid, or unreadable.
+It does not create checks, bypass them, or change permissions.
+Checks are configured outside YAML; the YAML alone cannot create an approval
+or lock. The later create pipeline uses `lockBehavior: sequential` and one stage
+to keep the environment lock through plan, review, and apply. Other lifecycle
+pipelines must use that same environment; manual Terraform commands do not
+participate in this whole-run lock. Backend blob locking is an additional layer.
+
+For this one-user playground, configure your own account as an environment
+approver and allow self-approval if required. A production deployment should use
+independent approvers and protected branches.
+
+### Guarded plan and saved-plan handoff
+
+`pipeline_terraform.py` has only `plan` and `apply` operations, not destroy.
+It verifies Terraform's pinned version, initializes the existing remote backend,
+checks formatting/schema, then plans. Before a plan is accepted, guards require:
+
+- Exactly the four sandbox resource addresses and the committed input values.
+- Expected subscription/resource groups, region, resource names, and ACR scope.
+- No imports, moved resources, deletion, or replacement. Sandbox-only creates,
+  updates, and no-ops are allowed; replacement requires a separate reviewed
+  approach rather than an automatic create-pipeline deletion.
+- For a not-yet-created ACR, an unknown role scope must directly reference the
+  sandbox registry, not another resource.
+
+Provisioning also requires an explicit request and an exact `aks-sandbox`
+confirmation. Apply verifies the binary plan's hash and a manifest binding it to
+the same source/configuration hash, commit, pipeline run, Terraform version,
+application, and service connection. It validates the saved plan again and
+applies that plan without generating another one. Terraform itself rejects a
+stale plan if the remote state changes meanwhile.
+
+Only the binary plan and noncredential manifest are eligible for artifact
+handoff. The runner captures `terraform show -json` in memory and never prints
+or publishes that JSON or state. Binary plans still potentially contain
+sensitive resource values: restrict run/artifact access to trusted users and set
+short retention before provisioning. Source/artifact hashes detect accidental
+mixups; they are not a security boundary against someone allowed to modify the
+pipeline and its credentials.
+
+Local validation for this step uses synthetic Azure DevOps responses, synthetic
+Terraform plans, and mocked subprocesses, with no Azure requests. Tests cover
+missing checks/permissions, OIDC selection, version and provider preflight,
+scope/delete guards, artifact tampering, and saved-plan-only apply. Actual Azure
+DevOps YAML compilation and service-connection access remain unverified until
+the pipeline is registered and run.
+All 65 Python unit tests and whitespace checks passed for this tooling commit.
