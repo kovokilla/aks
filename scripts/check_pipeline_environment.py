@@ -48,6 +48,22 @@ def require_checks(document, environment_id):
         raise ValueError("The environment needs enabled Approval and Exclusive lock checks.")
 
 
+def read_json(url, token):
+    request = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token, "Accept": "application/json",
+    })
+    try:
+        opener = urllib.request.build_opener(NoRedirect())
+        with opener.open(request, timeout=60) as response:
+            return json.loads(response.read())
+    except (urllib.error.URLError, ValueError) as exc:
+        # Do not print bodies, headers, URLs with query data, or OAuth tokens.
+        raise RuntimeError(
+            "Cannot read project/environment checks. Grant the project Build Service read access "
+            "to this environment/check configuration and verify the OAuth token mapping."
+        ) from exc
+
+
 def verify(env):
     settings = load_config(DEFAULT_CONFIG)
     if env.get("ENVIRONMENT_NAME") != settings["environment"]:
@@ -56,19 +72,12 @@ def verify(env):
     token = env.get("SYSTEM_ACCESSTOKEN", "")
     if not token or token.startswith("$("):
         raise ValueError("Map System.AccessToken to the task's SYSTEM_ACCESSTOKEN environment.")
-    request = urllib.request.Request(url, headers={
-        "Authorization": "Bearer " + token, "Accept": "application/json",
-    })
-    try:
-        opener = urllib.request.build_opener(NoRedirect())
-        with opener.open(request, timeout=60) as response:
-            document = json.loads(response.read())
-    except (urllib.error.URLError, ValueError) as exc:
-        # Do not print bodies, headers, URLs with query data, or OAuth tokens.
-        raise RuntimeError(
-            "Cannot read environment checks. Grant the project Build Service read access "
-            "to this environment/check configuration and verify the OAuth token mapping."
-        ) from exc
+    project_url = (env["SYSTEM_COLLECTIONURI"].rstrip("/") + "/_apis/projects/"
+                   + env["SYSTEM_TEAMPROJECTID"] + "?api-version=7.1")
+    project = read_json(project_url, token)
+    if project.get("visibility") != "private":
+        raise ValueError("Use a private Azure DevOps project to protect Terraform logs and plan artifacts.")
+    document = read_json(url, token)
     require_checks(document, env["ENVIRONMENT_ID"])
     print("Verified enabled Approval and Exclusive lock checks on the sandbox environment.")
 

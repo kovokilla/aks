@@ -1,0 +1,76 @@
+parameters:
+- name: action
+  type: string
+  values:
+  - plan
+  - apply
+- name: provisionResources
+  type: boolean
+  default: false
+- name: confirmEnvironment
+  type: string
+  default: not-confirmed
+
+steps:
+# Deployment jobs otherwise download all artifacts automatically.
+- download: none
+- checkout: self
+  clean: true
+  fetchDepth: 1
+  persistCredentials: false
+
+- bash: |
+    set -euo pipefail
+    TF_TOOLS_DIR="$(Agent.TempDirectory)/terraform-$(System.JobId)"
+    python3 scripts/install_terraform.py --directory "$TF_TOOLS_DIR"
+    "$TF_TOOLS_DIR/terraform" version
+    printf '##vso[task.prependpath]%s\n' "$TF_TOOLS_DIR"
+  workingDirectory: $(Build.SourcesDirectory)
+  displayName: Install and display pinned Terraform version
+
+- bash: python3 scripts/check_pipeline_environment.py
+  workingDirectory: $(Build.SourcesDirectory)
+  displayName: Require environment approval and exclusive lock checks
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    SYSTEM_COLLECTIONURI: $(System.CollectionUri)
+    SYSTEM_TEAMPROJECTID: $(System.TeamProjectId)
+    ENVIRONMENT_ID: $(Environment.Id)
+    ENVIRONMENT_NAME: $(Environment.Name)
+
+- ${{ if eq(parameters.action, 'apply') }}:
+  - task: DownloadPipelineArtifact@2
+    displayName: Download the reviewed plan from this run only
+    inputs:
+      buildType: current
+      artifactName: sandbox-plan
+      targetPath: $(Pipeline.Workspace)/sandbox-plan
+
+- task: AzureCLI@2
+  displayName: Terraform ${{ parameters.action }} with federated Azure authentication
+  inputs:
+    azureSubscription: azure-service-connection
+    addSpnToEnvironment: true
+    visibleAzLogin: false
+    scriptType: bash
+    scriptLocation: inlineScript
+    workingDirectory: $(Build.SourcesDirectory)
+    inlineScript: |
+      python3 scripts/pipeline_terraform.py ${{ parameters.action }} \
+        --bundle-dir "$PLAN_BUNDLE_DIR"
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+    SYSTEM_OIDCREQUESTURI: $(System.OidcRequestUri)
+    TF_RUN_ID: $(Build.BuildId)
+    TF_SOURCE_COMMIT: $(Build.SourceVersion)
+    PROVISION_REQUESTED: '${{ parameters.provisionResources }}'
+    SANDBOX_CONFIRMATION: ${{ parameters.confirmEnvironment }}
+    PLAN_BUNDLE_DIR: $(Pipeline.Workspace)/sandbox-plan
+
+- ${{ if and(eq(parameters.action, 'plan'), eq(parameters.provisionResources, true)) }}:
+  - task: PublishPipelineArtifact@1
+    displayName: Publish protected binary plan and manifest for review
+    inputs:
+      targetPath: $(Pipeline.Workspace)/sandbox-plan
+      artifact: sandbox-plan
+      publishLocation: pipeline

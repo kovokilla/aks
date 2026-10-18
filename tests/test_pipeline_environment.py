@@ -69,10 +69,19 @@ class EnvironmentChecksTests(unittest.TestCase):
 
     @mock.patch.object(checks.urllib.request, "build_opener")
     def test_read_only_verification(self, build_opener):
-        build_opener.return_value.open.return_value = io.BytesIO(json.dumps(configuration()).encode())
+        build_opener.return_value.open.side_effect = [
+            io.BytesIO(b'{"visibility":"private"}'),
+            io.BytesIO(json.dumps(configuration()).encode()),
+        ]
         checks.verify(environment())
         request = build_opener.return_value.open.call_args.args[0]
         self.assertEqual(request.get_method(), "GET")
+    @mock.patch.object(checks.urllib.request, "build_opener")
+    def test_public_project_rejected_before_check_or_artifact_access(self, build_opener):
+        build_opener.return_value.open.return_value = io.BytesIO(b'{"visibility":"public"}')
+        with self.assertRaisesRegex(ValueError, "private Azure DevOps project"):
+            checks.verify(environment())
+        self.assertEqual(build_opener.return_value.open.call_count, 1)
 
     @mock.patch.object(checks.urllib.request, "build_opener")
     def test_missing_token_and_wrong_environment_fail_without_network(self, build_opener):

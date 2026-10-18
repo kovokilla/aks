@@ -2,11 +2,15 @@
 
 A playground for an Azure DevOps subscription checker and a separate,
 Terraform-managed AKS sandbox. State-storage bootstrap and sandbox Terraform
-configuration are implemented. Automated create/destroy pipelines are not yet added.
+configuration and a manually triggered creation pipeline are implemented.
+The separate destruction pipeline is not yet added.
 
 ## Repository contents
 
 - `azure-pipelines-checker.yml`: manually triggered subscription checker.
+- `azure-pipelines-create.yml`: install/check Terraform, plan, review, and
+  optionally provision the sandbox.
+- `pipelines/templates/terraform-job-steps.yml`: shared deployment-job steps.
 - `config/backend.json`: nonsecret playground state-storage settings.
 - `scripts/bootstrap_state.py`: guarded, one-time Azure state-storage bootstrap.
 - `scripts/init_backend.py`: initialize the Azure backend with a human CLI login.
@@ -14,7 +18,7 @@ configuration are implemented. Automated create/destroy pipelines are not yet ad
 - `scripts/check_pipeline_environment.py`: read-only verification of Azure DevOps
   environment approval and locking checks.
 - `scripts/pipeline_terraform.py`: guarded native-OIDC runner for saved-plan
-  creation/application by the forthcoming Azure DevOps pipeline.
+  creation/application by Azure DevOps.
 - `terraform/`: sandbox resources, remote backend declaration, inputs, outputs,
   signed provider lockfile, and targeted mock-plan tests.
 - `tests/`: offline bootstrap, backend initialization, and installer unit tests.
@@ -315,9 +319,9 @@ pipeline identity. Human Owner access alone does not prove pipeline data-plane
 access. No live Terraform initialization, plan, apply, or destroy has been
 verified, and there is no verified Terraform state blob yet.
 
-Subsequent commits will add shared pipeline tooling,
-manual creation pipeline, guarded destruction pipeline, and the final lifecycle
-walkthrough. Each will update this README with its own usage and validation.
+Shared pipeline tooling and the creation pipeline are documented below.
+The guarded destruction pipeline remains a separate future step. Each commit
+updates this README with its own usage and validation.
 
 ## Infrastructure lifecycle: step 2 — Terraform configuration and backend access
 
@@ -444,7 +448,7 @@ For an empty sandbox state, expect four managed resource creations and no change
 to state-storage or existing `fitxmatt` resources. Stop if the plan differs
 unexpectedly. Never use `-target` for the real lifecycle plan. Saved plans and
 state may contain sensitive data; they are ignored and must not be shared.
-Do not run `apply` yet.
+Do not run a manual Cloud Shell `apply`; use the reviewed pipeline in step 4.
 
 Offline local validation uses:
 
@@ -460,7 +464,7 @@ to avoid AzureRM's generated kubelet-identity block, which generic mocks do not
 reproduce. They check sandbox naming, VMSS settings, ACR/local-account security,
 node count, and group isolation. They do **not** validate the full RBAC graph or
 contact Azure. Provider-schema validation covers all declared resource arguments.
-The real Cloud Shell plan is still needed for the complete graph and Azure
+The real Azure DevOps plan is still needed for the complete graph and Azure
 permissions. Test teardown refers only to mock state, not live resources.
 
 Local results: Terraform formatting and schema validation passed; all five
@@ -474,7 +478,7 @@ live plan, apply, or destroy is claimed.
 
 The recommended path is now Azure DevOps rather than a human Cloud Shell login.
 The Cloud Shell initializer remains an optional diagnostic. Pipeline YAML is
-added in step 4; this step supplies its shared runner and safety checks.
+described in step 4; this step supplies its shared runner and safety checks.
 
 ### Pipeline identity and authentication
 
@@ -518,11 +522,12 @@ checks**. Authorize the intended pipeline to use the environment. Grant the
 project Build Service identity read access to its environment/check configuration
 so the job's OAuth token can query it.
 
-The checker script uses a GET request to Azure DevOps's checks API and refuses
+The checker script uses read-only GET requests to require a private Azure DevOps
+project and query its checks API, and refuses
 to proceed if either required check is absent, disabled, invalid, or unreadable.
 It does not create checks, bypass them, or change permissions.
 Checks are configured outside YAML; the YAML alone cannot create an approval
-or lock. The later create pipeline uses `lockBehavior: sequential` and one stage
+or lock. The create pipeline uses `lockBehavior: sequential` and one stage
 to keep the environment lock through plan, review, and apply. Other lifecycle
 pipelines must use that same environment; manual Terraform commands do not
 participate in this whole-run lock. Backend blob locking is an additional layer.
@@ -567,3 +572,124 @@ scope/delete guards, artifact tampering, and saved-plan-only apply. Actual Azure
 DevOps YAML compilation and service-connection access remain unverified until
 the pipeline is registered and run.
 All 65 Python unit tests and whitespace checks passed for this tooling commit.
+
+## Infrastructure lifecycle: step 4 — manual provisioning pipeline
+
+### One-time Azure DevOps setup
+
+1. Configure the `aks-sandbox` Azure DevOps environment, enabled Approval and
+   Exclusive lock checks, and Build Service read access described in step 3.
+   These are Azure DevOps controls, not Azure resources.
+2. Confirm that the workload-federated `azure-service-connection` has the Azure
+   data-plane, provisioning, and role-assignment permissions listed in step 3.
+   The subscription checker succeeding does **not** prove these permissions.
+3. Use a **private Azure DevOps project**; the preflight rejects a public project
+   before Terraform runs. The source GitHub repository can remain public.
+   Limit pipeline edit/queue/run/artifact permissions to trusted users. Configure
+   short pipeline-run retention (the shortest permitted by your organization)
+   before using the provisioning option. Binary plans are sensitive and artifacts
+   follow run retention; the YAML does not override organization retention rules.
+4. Select **Pipelines → New pipeline → GitHub → `kovokilla/aks` → Existing Azure
+   Pipelines YAML file**. Choose branch `feat/terraform-lifecycle` until merged,
+   then `main`, and select `/azure-pipelines-create.yml`.
+5. Save the pipeline. Authorize this specific pipeline for both the environment
+   and service connection when prompted. No variable group or marketplace
+   Terraform extension is required.
+
+### First run: version check, backend access, and plan only
+
+Run with the default **`provisionResources = false`**. No apply job is generated.
+Approve the environment's stage-level check when prompted. The plan job then:
+
+1. Installs checksum-verified Terraform **1.13.3** on the hosted Linux agent and
+   displays its version. It does not rely on the agent's preinstalled version.
+2. Verifies enabled environment Approval and Exclusive lock checks through the
+   Azure DevOps API; missing checks/read permissions stop execution.
+3. Signs in through `AzureCLI@2`, verifies the expected subscription, tenant,
+   application, Terraform version, and registered Azure providers.
+4. Uses native refreshable workload federation to initialize the **existing**
+   Azure backend at `sandbox/terraform.tfstate`.
+5. Runs formatting checks, provider-schema validation, and the full real
+   Terraform plan, then validates its sandbox-only changes.
+
+This first run verifies backend initialization using the **pipeline identity**
+instead of your Cloud Shell user. Success is not claimed until actual run logs
+are available. The plan acquires/releases backend state locking as part of
+Terraform's operation, but the pipeline does not conduct a separate contention
+test. No application/AKS deployment is performed in plan-only mode.
+No plan artifact is published in this mode; inspect the protected run's plan log.
+
+### Provision on demand
+
+Once the plan-only run succeeds and you are ready for Azure charges:
+
+1. Start a **new run**, set **`provisionResources = true`**, and type
+   **`aks-sandbox`** in **`confirmEnvironment`**.
+2. Approve the environment stage check. A new plan is generated for this run and
+   published as the restricted `sandbox-plan` artifact.
+3. The agentless **ReviewPlan** job pauses. Review that run's plan log, expected
+   subscription, all four sandbox addresses, sizing, and cost. The manual review
+   times out and rejects after 30 minutes. With no email recipients configured,
+   watch the Azure DevOps run page for the pending review.
+4. **Resume** to provision or **Reject** to stop. For this playground, queue-build
+   permission holders may review and self-approval is explicitly allowed.
+   Use explicit independent approvers and branch protection for production.
+5. After approval, the apply deployment job installs the same Terraform version,
+   rechecks environment controls, downloads the artifact from this run only,
+   initializes the same backend, validates artifact/source/run/identity binding
+   and plan scope, then applies the exact reviewed binary plan.
+
+One stage references the same environment for both deployment jobs and uses
+`lockBehavior: sequential`; the configured Exclusive lock check holds across
+planning, agentless review, and apply. Do not split this into separate stages
+without redesigning locking and stale-plan handling. The eventual destruction
+pipeline must reference the same environment and state key.
+
+There are no automatic push or PR triggers. An explicit confirmation cannot be
+injected into a shell command: it is passed through an environment variable and
+validated before provisioning. Deletes/replacements are rejected even when
+provisioning is requested. A stale or mismatched artifact fails rather than being
+silently replanned or applied.
+
+If apply fails or is cancelled, resources can be partially created and billed.
+Terraform persists state as operations complete; inspect the state and a new
+full plan before retrying. Do not delete the backend, force-unlock an active run,
+or rerun only the old apply job. Start a new pipeline run after resolving the
+failure. ACR images, workloads, and data are not restored by recreating resources.
+
+### Costs, capacity, and troubleshooting
+
+AKS's Free control-plane tier does **not** make the environment free: node VMs,
+managed disks, ACR, outbound networking, public IPs, and storage incur charges.
+Use Azure pricing/cost management for your subscription; no live price estimate
+or quota check has been performed. The apply job requests 120 minutes, but an
+organization's free hosted-job time limit may be lower and still terminate it.
+Have sufficient hosted parallel-job capacity and time allowance before applying.
+
+- **Missing environment/permission prompt:** create/authorize the correct
+  environment and connection; do not select the checker YAML by mistake.
+- **Environment-check API 401/403:** check Build Service environment/check read
+  permissions and job OAuth mapping. This is separate from Azure IAM.
+- **OIDC missing/invalid:** the connection must use workload federation, not a
+  GitHub connection or client-secret connection. Required OAuth/request URI
+  variables and the task-provided service connection ID must be available.
+- **Backend 403:** verify the actual service principal has container-scoped
+  Storage Blob Data Contributor and wait for propagation. Do not enable keys.
+- **Provider not registered:** an administrator must register the named provider
+  separately. The pipeline deliberately does not do this during plan.
+- **Resource/RBAC authorization failure:** grant appropriately scoped deployment
+  and `AcrPull` assignment rights; don't confuse application and principal IDs.
+- **Name/SKU/quota/version/policy failure:** adjust committed sandbox inputs
+  after reviewing the Azure error, then queue a new full plan.
+- **Replacement/delete guard failure:** stop and review why replacement is
+  needed. This create pipeline is not an implicit destroy mechanism.
+
+### Validation record
+
+Local validation covers both YAML files' syntax and plan-only/provisioning job
+structure, Bash syntax, all 66 offline Python tests, and the existing Terraform
+format/schema checks and five targeted mock tests. The unchanged subscription
+checker is preserved. Azure DevOps server-side template compilation, environment
+checks, native federation, the full real plan, and provisioning have **not** been
+executed. No Azure resources were modified while implementing this pipeline.
+The next live action should be a **plan-only** run, not an apply.
