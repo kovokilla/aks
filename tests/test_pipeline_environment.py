@@ -34,6 +34,12 @@ def configuration():
 class EnvironmentChecksTests(unittest.TestCase):
     def test_expected_checks(self):
         checks.require_checks(configuration(), "42")
+    def test_unwrapped_response_supported(self):
+        checks.require_checks(configuration()["value"], "42")
+
+    def test_unexpected_response_shape_is_not_treated_as_empty(self):
+        with self.assertRaisesRegex(ValueError, "response shape"):
+            checks.require_checks({"unexpected": []}, "42")
     def test_approval_label_variants_and_stable_id(self):
         for name, identifier in (
             ("Approvals", ""), ("APPROVALS", ""),
@@ -74,11 +80,11 @@ class EnvironmentChecksTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checks.require_checks(data, "42")
 
-    def test_official_scoped_endpoint(self):
+    def test_official_resource_query_endpoint(self):
         url = checks.checks_url(environment())
         self.assertTrue(url.startswith("https://dev.azure.com/example/"))
-        self.assertIn("resourceType=environment", url)
-        self.assertIn("resourceId=42", url)
+        self.assertIn("/_apis/pipelines/checks/queryconfigurations?", url)
+        self.assertIn("api-version=7.1-preview.1", url)
 
     def test_untrusted_url_or_bad_environment_id_rejected(self):
         for key, value in (
@@ -99,7 +105,23 @@ class EnvironmentChecksTests(unittest.TestCase):
         ]
         checks.verify(environment())
         request = build_opener.return_value.open.call_args.args[0]
-        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(json.loads(request.data), [{
+            "type": "environment", "id": "42", "name": "aks-sandbox",
+        }])
+        first = build_opener.return_value.open.call_args_list[0].args[0]
+        self.assertEqual(first.get_method(), "GET")
+    @mock.patch.object(checks.urllib.request, "build_opener")
+    def test_empty_query_reports_project_and_job_token_visibility(self, build_opener):
+        build_opener.return_value.open.side_effect = [
+            io.BytesIO(b'{"visibility":"private"}'),
+            io.BytesIO(b'{"count":0,"value":[]}'),
+        ]
+        with self.assertRaises(ValueError) as error:
+            checks.verify(environment())
+        self.assertIn(environment()["SYSTEM_TEAMPROJECTID"], str(error.exception))
+        self.assertIn("Build Service", str(error.exception))
+        self.assertNotIn(environment()["SYSTEM_ACCESSTOKEN"], str(error.exception))
     @mock.patch.object(checks.urllib.request, "build_opener")
     def test_public_project_rejected_before_check_or_artifact_access(self, build_opener):
         build_opener.return_value.open.return_value = io.BytesIO(b'{"visibility":"public"}')

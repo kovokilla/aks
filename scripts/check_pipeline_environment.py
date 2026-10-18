@@ -26,18 +26,20 @@ def checks_url(env):
     environment_id = env.get("ENVIRONMENT_ID", "")
     if not environment_id.isdigit():
         raise ValueError("The deployment job must provide a numeric Environment.Id.")
-    query = urllib.parse.urlencode({
-        "resourceType": "environment", "resourceId": environment_id,
-        "api-version": "7.1-preview.1",
-    })
     return (urllib.parse.urlunsplit(collection).rstrip("/")
-            + f"/{project}/_apis/pipelines/checks/configurations?{query}")
+            + f"/{project}/_apis/pipelines/checks/queryconfigurations?api-version=7.1-preview.1")
 
 
 def require_checks(document, environment_id):
     enabled = set()
     observed = []
-    for check in document.get("value", []):
+    if isinstance(document, list):
+        configurations = document
+    elif isinstance(document, dict) and isinstance(document.get("value"), list):
+        configurations = document["value"]
+    else:
+        raise ValueError("Unexpected Azure DevOps checks response shape; refusing to assume no checks.")
+    for check in configurations:
         resource = check.get("resource") or {}
         check_type = check.get("type") or {}
         kind = re.sub("[^a-z]", "", check_type.get("name", "").lower())
@@ -63,10 +65,16 @@ def require_checks(document, environment_id):
         )
 
 
-def read_json(url, token):
-    request = urllib.request.Request(url, headers={
+def read_json(url, token, payload=None):
+    headers = {
         "Authorization": "Bearer " + token, "Accept": "application/json",
-    })
+    }
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode()
+    # POST queryconfigurations is a documented read-only query, not a mutation.
+    request = urllib.request.Request(url, headers=headers, data=data)
     try:
         opener = urllib.request.build_opener(NoRedirect())
         with opener.open(request, timeout=60) as response:
@@ -92,8 +100,20 @@ def verify(env):
     project = read_json(project_url, token)
     if project.get("visibility") != "private":
         raise ValueError("Use a private Azure DevOps project to protect Terraform logs and plan artifacts.")
-    document = read_json(url, token)
-    require_checks(document, env["ENVIRONMENT_ID"])
+    resources = [{
+        "type": "environment", "id": env["ENVIRONMENT_ID"],
+        "name": env["ENVIRONMENT_NAME"],
+    }]
+    document = read_json(url, token, resources)
+    try:
+        require_checks(document, env["ENVIRONMENT_ID"])
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc} Queried project {env['SYSTEM_TEAMPROJECTID']}, "
+            f"environment {env['ENVIRONMENT_ID']}. If the UI shows checks, verify "
+            "the project Build Service can read environment/check configuration; "
+            "a job token may see fewer checks than your signed-in browser."
+        ) from exc
     print("Verified enabled Approval and Exclusive lock checks on the sandbox environment.")
 
 

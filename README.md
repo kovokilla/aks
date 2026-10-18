@@ -522,8 +522,9 @@ checks**. Authorize the intended pipeline to use the environment. Grant the
 project Build Service identity read access to its environment/check configuration
 so the job's OAuth token can query it.
 
-The checker script uses read-only GET requests to require a private Azure DevOps
-project and query its checks API, and refuses
+The checker script uses a GET request to require a private Azure DevOps project
+and a documented read-only `POST .../checks/queryconfigurations` request with an
+explicit environment resource reference to retrieve its checks. It refuses
 to proceed if either required check is absent, disabled, invalid, or unreadable.
 It does not create checks, bypass them, or change permissions.
 Checks are configured outside YAML; the YAML alone cannot create an approval
@@ -677,6 +678,14 @@ Have sufficient hosted parallel-job capacity and time allowance before applying.
   scope/disabled/error flags without dumping the API response. UI labels alone
   do not establish what the API returned; share the new diagnostic if it persists.
   `Lock not in use` on an idle environment is normal, not a disabled lock.
+- **Observed API check types: none:** the initial filtered GET returned no checks
+  even though the operator's UI showed them. The guard now uses the documented
+  resource-reference query endpoint with environment type, ID, and name.
+  This POST only reads configuration; it does not create or alter checks.
+  If the explicit query is also empty, compare the reported project/environment
+  with the UI and grant the project Build Service access to read the environment
+  and its check configuration. Browser-admin visibility does not prove job-token
+  visibility. No empty or unexpected response bypasses either guard.
 - **OIDC missing/invalid:** the connection must use workload federation, not a
   GitHub connection or client-secret connection. Required OAuth/request URI
   variables and the task-provided service connection ID must be available.
@@ -694,12 +703,14 @@ Have sufficient hosted parallel-job capacity and time allowance before applying.
 ### Validation record
 
 Local validation covers both YAML files' syntax and plan-only/provisioning job
-structure, Bash syntax, all 68 offline Python tests, and the existing Terraform
+structure, Bash syntax, all 71 offline Python tests, and the existing Terraform
 format/schema checks and five targeted mock tests. The unchanged subscription
 checker is preserved. The first operator-reported Azure DevOps run reached the
 environment preflight and stopped there; a subsequent screenshot showed both
 checks configured. Label compatibility and safe diagnostics were improved, but
-that update still needs a new run. Native federation, backend initialization,
+an updated run then reported an empty checks response. The explicit resource
+query and permission-context diagnostics still need a new live run.
+Native federation, backend initialization,
 the full real plan, and provisioning remain unverified. No Azure resources were
 modified while implementing this pipeline.
 The next live action should be a **plan-only** run, not an apply.
