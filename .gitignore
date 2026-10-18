@@ -1,0 +1,24 @@
+# Terraform state, plans, caches, and local overrides
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+*.plan
+crash.log
+crash.*.log
+*.local.hcl
+*.local.json
+*.local.tfvars
+*.local.tfvars.json
+# Keep .terraform.lock.hcl tracked.
+
+# Credentials and local tooling
+.env
+.env.*
+*.pem
+*.key
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store

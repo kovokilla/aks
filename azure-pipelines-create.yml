@@ -1,0 +1,72 @@
+trigger: none
+pr: none
+
+parameters:
+- name: provisionResources
+  displayName: Provision sandbox resources after plan approval (incurs Azure charges)
+  type: boolean
+  default: false
+- name: confirmEnvironment
+  displayName: Type aks-sandbox to enable provisioning
+  type: string
+  default: not-confirmed
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: Sandbox
+  displayName: Check Terraform, plan, and optionally provision sandbox
+  # Configure the Exclusive lock check on this environment in Azure DevOps.
+  # One stage holds it through plan, manual review, and apply.
+  lockBehavior: sequential
+  jobs:
+  - deployment: Plan
+    displayName: Check version and plan with Azure-hosted state
+    environment: aks-sandbox
+    timeoutInMinutes: 60
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: pipelines/templates/terraform-job-steps.yml
+            parameters:
+              action: plan
+              provisionResources: ${{ parameters.provisionResources }}
+              confirmEnvironment: ${{ parameters.confirmEnvironment }}
+
+  - ${{ if eq(parameters.provisionResources, true) }}:
+    - job: ReviewPlan
+      displayName: Review the exact sandbox plan before provisioning
+      dependsOn: Plan
+      pool: server
+      timeoutInMinutes: 35
+      steps:
+      - task: ManualValidation@1
+        timeoutInMinutes: 30
+        inputs:
+          notifyUsers: ''
+          # Single-user playground: queue-build permission holders can approve.
+          allowApproversToApproveTheirOwnRuns: true
+          instructions: |
+            Review this run's Terraform plan log. Only the four sandbox resource
+            addresses may change. Confirm subscription, names, node count, cost,
+            and that state storage/fitxmatt resources are untouched.
+            The sandbox-plan artifact is sensitive: do not share it publicly.
+            Resume to provision using that exact plan, or reject to stop.
+          onTimeout: reject
+
+    - deployment: Apply
+      displayName: Provision resources using the reviewed saved plan
+      dependsOn: ReviewPlan
+      environment: aks-sandbox
+      timeoutInMinutes: 120
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - template: pipelines/templates/terraform-job-steps.yml
+              parameters:
+                action: apply
+                provisionResources: ${{ parameters.provisionResources }}
+                confirmEnvironment: ${{ parameters.confirmEnvironment }}
