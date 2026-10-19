@@ -2,14 +2,16 @@
 
 A playground for an Azure DevOps subscription checker and a separate,
 Terraform-managed AKS sandbox. State-storage bootstrap and sandbox Terraform
-configuration and a manually triggered creation pipeline are implemented.
-The separate destruction pipeline is not yet added.
+configuration and separate manually triggered creation/destruction pipelines
+are implemented. Only the create plan-only path has been verified live.
 
 ## Repository contents
 
 - `azure-pipelines-checker.yml`: manually triggered subscription checker.
 - `azure-pipelines-create.yml`: install/check Terraform, plan, review, and
   optionally provision the sandbox.
+- `azure-pipelines-destroy.yml`: preview deletion and optionally apply a reviewed,
+  delete-only plan for Terraform-tracked sandbox resources.
 - `pipelines/templates/terraform-job-steps.yml`: shared deployment-job steps.
 - `config/backend.json`: nonsecret playground state-storage settings.
 - `scripts/bootstrap_state.py`: guarded, one-time Azure state-storage bootstrap.
@@ -321,7 +323,7 @@ Human Owner access alone would not have proved pipeline data-plane access.
 No apply, destroy, state recovery, or deployed sandbox has yet been verified.
 
 Shared pipeline tooling and the creation pipeline are documented below.
-The guarded destruction pipeline remains a separate future step. Each commit
+The separate guarded destruction pipeline is documented in step 5. Each commit
 updates this README with its own usage and validation.
 
 ## Infrastructure lifecycle: step 2 — Terraform configuration and backend access
@@ -367,7 +369,8 @@ requires separate AKS Azure RBAC assignments.
 
 ### Initialize the backend in Cloud Shell without applying
 
-Use a fresh checkout of `feat/terraform-lifecycle` until it is merged. Earlier
+Use `main` for the merged configuration, or explicitly select the feature branch
+containing an unmerged change you intend to test. Earlier
 Cloud Shell checkouts may have manual patches: preserve them instead of using
 `git reset --hard` or overwriting files.
 
@@ -551,7 +554,9 @@ independent approvers and protected branches.
 
 ### Guarded plan and saved-plan handoff
 
-`pipeline_terraform.py` has only `plan` and `apply` operations, not destroy.
+`pipeline_terraform.py` has `plan` and `apply` actions with separate `create`
+(default) and `destroy` operation modes. The following guards describe create
+mode; destroy's stricter state and deletion guards are documented in step 5.
 It verifies Terraform's pinned version, initializes the existing remote backend,
 checks formatting/schema, then plans. Before a plan is accepted, guards require:
 
@@ -566,7 +571,7 @@ checks formatting/schema, then plans. Before a plan is accepted, guards require:
 Provisioning also requires an explicit request and an exact `aks-sandbox`
 confirmation. Apply verifies the binary plan's hash and a manifest binding it to
 the same source/configuration hash, commit, pipeline run, Terraform version,
-application, and service connection. It validates the saved plan again and
+application, service connection, and lifecycle operation. It validates the saved plan again and
 applies that plan without generating another one. Terraform itself rejects a
 stale plan if the remote state changes meanwhile.
 
@@ -605,8 +610,8 @@ and current full-suite count are recorded in step 4.
    before using the provisioning option. Binary plans are sensitive and artifacts
    follow run retention; the YAML does not override organization retention rules.
 4. Select **Pipelines → New pipeline → GitHub → `kovokilla/aks` → Existing Azure
-   Pipelines YAML file**. Choose branch `feat/terraform-lifecycle` until merged,
-   then `main`, and select `/azure-pipelines-create.yml`.
+   Pipelines YAML file**. Choose branch `main` and select
+   `/azure-pipelines-create.yml`.
 5. Save the pipeline. Authorize this specific pipeline for both the environment
    and service connection when prompted. No variable group or marketplace
    Terraform extension is required.
@@ -658,8 +663,8 @@ Once the plan-only run succeeds and you are ready for Azure charges:
 One stage references the same environment for both deployment jobs and uses
 `lockBehavior: sequential`; the configured Exclusive lock check holds across
 planning, agentless review, and apply. Do not split this into separate stages
-without redesigning locking and stale-plan handling. The eventual destruction
-pipeline must reference the same environment and state key.
+without redesigning locking and stale-plan handling. The destruction pipeline
+in step 5 references the same environment and state key.
 
 There are no automatic push or PR triggers. An explicit confirmation cannot be
 injected into a shell command: it is passed through an environment variable and
@@ -758,3 +763,145 @@ When explicitly ready to incur sandbox charges, start a new run with
 `provisionResources = true`, confirm `aks-sandbox`, and review that new run's plan
 before approving it. The previously completed plan-only run is not an apply
 authorization and is not automatically reused.
+
+## Infrastructure lifecycle: step 5 — manual destruction pipeline
+
+### Scope and irreversible effects
+
+`azure-pipelines-destroy.yml` is separate from creation. It uses the same
+`azure-service-connection`, protected `aks-sandbox` environment, default Terraform
+workspace, and Azure backend key `sandbox/terraform.tfstate`.
+Push and PR triggers are disabled.
+
+After explicit authorization, it can delete only a nonempty, valid subset of
+these Terraform-tracked sandbox addresses:
+
+- `azurerm_resource_group.sandbox`
+- `azurerm_container_registry.sandbox`
+- `azurerm_kubernetes_cluster.sandbox`
+- `azurerm_role_assignment.acr_pull`
+
+**Destroying AKS deletes its workloads/data and its managed node resource group,
+nodes, and associated networking. Destroying ACR deletes its images.** Those
+contents need not appear as separate Terraform addresses. Use these dedicated
+sandbox groups only; do not put unrelated workloads or resources inside them.
+Resource recreation does not restore images, workloads, data, or old public IPs.
+Back up anything needed before approving destruction.
+
+State storage (`aks-tfstate-rg`, account, container, and state/version history)
+and existing `fitxmatt` resources are outside this Terraform configuration.
+Their identities cannot pass destroy scope validation. Terraform updates the
+retained state as removals complete; the pipeline does not delete the backend or
+use `az group delete`. AzureRM's nonempty-resource-group deletion protection stays
+enabled and is never bypassed.
+
+### Register the pipeline and preview first
+
+1. In a private Azure DevOps project, create a pipeline from this repository using
+   **Existing Azure Pipelines YAML file → `/azure-pipelines-destroy.yml`**.
+   Select `feat/terraform-destroy` while its PR is unmerged, then `main` after merge.
+2. Authorize this specific new pipeline for the existing environment and service
+   connection. Keep the environment's native Approval and Exclusive lock checks
+   enabled. No check-configuration API access or additional environment
+   Administrator grant is required.
+3. Verify the service principal has container-scoped blob-data access and rights
+   to delete sandbox resources and the scoped `AcrPull` role assignment.
+   Environment permissions are separate from Azure IAM; the pipeline never
+   elevates itself.
+4. Start a run with **`destroyResources = false`** and
+   **`confirmDestruction = destroy aks-sandbox`**. The exact phrase is required
+   even for preview, to confirm which environment is being inspected.
+5. Approve the native environment check and review the destroy-plan log.
+   Preview generates no deletion job and publishes no plan artifact.
+
+The runner checks Terraform's pinned version, authenticates through native
+refreshable OIDC, initializes the existing backend, and validates the configuration.
+It reads state privately in memory before invoking `terraform plan -destroy`.
+Neither state JSON nor plan JSON is printed or published.
+
+**Empty state is rejected before planning.** If you have only completed the
+create plan-only run, there may be no tracked resources to destroy; that refusal
+is expected. Empty state is not proof that no untracked Azure resources exist.
+Do not apply creation merely to make a destroy preview succeed.
+
+A complete applied sandbox normally produces `0 to add, 0 to change, 4 to destroy`.
+A valid partial state from a failed create may contain fewer than four addresses
+and is supported for cleanup. The guard validates actual resource IDs,
+subscription/group/location, Terraform ownership/environment tags, node-group
+identity, provider source, ACR role scope, and kubelet/principal linkage when
+both cluster and role are tracked. Unknown addresses, modules, unrelated IDs,
+missing ownership, unexpected providers, or malformed state stop the run.
+
+After refresh, the saved plan must delete exactly its remaining nonempty
+validated inventory. Creates, updates, no-ops, replacements, imports, moves,
+retained planned resources, and inconsistent prior-state/before values are
+rejected. Resources already removed outside Terraform may disappear on refresh;
+the remaining planned deletions must still pass all identity checks.
+
+### Approve actual deletion
+
+Only when the preview is understood and backups are sufficient:
+
+1. Start a **new run**, check **`destroyResources`**, and type the exact phrase
+   **`destroy aks-sandbox`** in **`confirmDestruction`**.
+2. Approve the native environment stage check. A new delete-only plan is generated.
+3. Review the **ReviewDestroyPlan** manual validation prompt and that run's log.
+   Reject anything unexpected. Approval times out and rejects after 30 minutes;
+   this single-user playground permits queue-build permission holders to
+   self-approve, as the creation workflow does.
+4. Resume only to authorize deletion. The apply job downloads
+   **`sandbox-destroy-plan`** from this run only, verifies the operation/source/
+   run/commit/identity/plan hashes, validates the saved destroy plan again, and
+   privately rechecks the current state's IDs before applying that exact plan.
+
+The actual command is `terraform apply <reviewed-saved-plan>`, not a freshly
+generated `terraform destroy -auto-approve`. The saved binary contains the
+reviewed deletion actions. There is no live deletion without the checked boolean,
+correct phrase, and completed manual review in the pipeline.
+
+Creation retains its default `create` mode and `sandbox-plan` artifact.
+Destroy uses explicit `destroy` mode and `sandbox-destroy-plan`; manifests now
+also bind the lifecycle operation. A creation artifact cannot be consumed by
+destroy or vice versa. Start new runs after this update: old artifacts without
+operation metadata are deliberately rejected.
+
+Both pipelines keep plan/review/apply within one stage, target the same protected
+environment, and use `lockBehavior: sequential`. Native environment locking
+serializes their whole stages; backend leases additionally protect Terraform
+operations. The agent does not audit native-check presence, so environment owners
+must retain both controls. Manual CLI Terraform runs do not participate in the
+whole-stage lock, and Terraform rejects stale saved plans if state changes.
+
+### Failure recovery and remaining verification
+
+Deletion is not transactional. A failed/cancelled apply can leave partial
+resources and ongoing charges; inspect the result and start a new preview/run
+using the same backend. Do not replay an old apply job, delete the state blob,
+run `state rm` to hide resources, bypass ownership checks, or force-unlock an
+active operation. If a guard finds drift or unexpected resources, review actual
+Azure ownership before any manual recovery.
+
+The scope guard covers tracked ARM resources, not backups of cluster contents.
+Untracked Azure resources can cause the provider's nonempty-group safeguard to
+stop group deletion. Do not place unrelated resources in the AKS-managed node
+group, whose lifecycle AKS owns. Plan artifacts remain sensitive: restrict access,
+use short run retention, and never upload state/plan JSON to public logs.
+Hosted-job time limits, service-principal deletion permissions, Azure locks,
+policy, network reachability, and complete asynchronous AKS cleanup still require
+live verification.
+
+Destroy validation is offline only: all 87 Python unit tests passed, including the
+existing creation tests. YAML parsing and local parameter/conditional expansion
+checked six create/destroy template variants, both preview/execution modes,
+approval/lock wiring, artifact separation, and Bash syntax. Terraform formatting,
+provider-schema validation, and all five targeted mocked Terraform tests passed
+with `-backend=false`. The creation/checker root YAML and Terraform resource
+configuration were left unchanged. This is not Azure DevOps server-side
+template compilation or a live deletion test.
+
+Tests use synthetic full/partial/empty state,
+delete-only plans, and mocked executors. They cover scope/ownership/principal
+guards, confirmation, state rechecks, cross-operation artifacts, and unchanged
+create behavior. No live destroy preview, apply, or deletion was performed while
+implementing this change. Register the pipeline and use preview-only mode first
+when actual tracked sandbox resources exist.

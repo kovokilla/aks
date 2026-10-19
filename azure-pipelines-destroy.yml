@@ -1,0 +1,78 @@
+trigger: none
+pr: none
+
+parameters:
+- name: destroyResources
+  displayName: Delete sandbox resources after destroy-plan approval (irreversible)
+  type: boolean
+  default: false
+- name: confirmDestruction
+  displayName: Type destroy aks-sandbox to confirm scope (required for preview too)
+  type: string
+  default: not-confirmed
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: DestroySandbox
+  displayName: Preview and optionally destroy only Terraform-managed sandbox resources
+  # This must be the same protected environment used by the create pipeline.
+  lockBehavior: sequential
+  jobs:
+  - deployment: DestroyPlan
+    displayName: Validate nonempty sandbox state and generate a destroy plan
+    environment: aks-sandbox
+    timeoutInMinutes: 60
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: pipelines/templates/terraform-job-steps.yml
+            parameters:
+              operation: destroy
+              action: plan
+              artifactName: sandbox-destroy-plan
+              destroyResources: ${{ parameters.destroyResources }}
+              confirmDestruction: ${{ parameters.confirmDestruction }}
+
+  - ${{ if eq(parameters.destroyResources, true) }}:
+    - job: ReviewDestroyPlan
+      displayName: Approve irreversible sandbox deletion
+      dependsOn: DestroyPlan
+      pool: server
+      timeoutInMinutes: 35
+      steps:
+      - task: ManualValidation@1
+        timeoutInMinutes: 30
+        inputs:
+          notifyUsers: ''
+          # Single-user playground; configure independent approvers in production.
+          allowApproversToApproveTheirOwnRuns: true
+          instructions: |
+            Review this run's destroy-plan log and the exact sandbox addresses.
+            Expect deletes only: no creates, updates, replacements, or imports.
+            Confirm the subscription, resource IDs, and ownership tags.
+            This deletes AKS workloads/data, managed nodes/networking, and ACR images.
+            State storage and existing fitxmatt resources must not be targeted.
+            A partial sandbox can have fewer than four tracked resources.
+            Resume only if deletion is intended and backups are sufficient.
+            Reject if any resource or consequence is unexpected.
+          onTimeout: reject
+
+    - deployment: DestroyApply
+      displayName: Apply the exact reviewed destroy plan
+      dependsOn: ReviewDestroyPlan
+      environment: aks-sandbox
+      timeoutInMinutes: 120
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - template: pipelines/templates/terraform-job-steps.yml
+              parameters:
+                operation: destroy
+                action: apply
+                artifactName: sandbox-destroy-plan
+                destroyResources: ${{ parameters.destroyResources }}
+                confirmDestruction: ${{ parameters.confirmDestruction }}
