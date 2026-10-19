@@ -335,7 +335,7 @@ The root module in `terraform/` defines four managed resources:
 1. `aks-sandbox-rg`: separate sandbox resource group in North Europe.
 2. `akssandbox2c209a53`: Basic ACR with admin credentials disabled.
 3. `aks-sandbox`: Free-tier AKS control plane with a VMSS-backed `system` pool,
-   one `Standard_D2s_v5` node, Azure CNI overlay, managed identity, and Entra/Azure
+   one `Standard_B2s_v2` node, Azure CNI overlay, managed identity, and Entra/Azure
    RBAC with local accounts disabled. Node count is fixed, not autoscaled.
 4. An `AcrPull` assignment for the kubelet identity scoped only to the new ACR.
 
