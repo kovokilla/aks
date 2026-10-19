@@ -5,7 +5,7 @@ parameters:
 - name: provisionResources
   displayName: Provision sandbox resources after plan approval (incurs Azure charges)
   type: boolean
-  default: false
+  default: true
 - name: confirmEnvironment
   displayName: Type aks-sandbox to enable provisioning
   type: string
