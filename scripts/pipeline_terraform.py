@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Azure DevOps OIDC plan/apply runner; never performs destroy or bootstrap."""
+"""Azure DevOps OIDC lifecycle runner; destructive plans require separate safeguards."""
 
 import argparse
 import hashlib
@@ -20,6 +20,8 @@ from install_terraform import VERSION
 ROOT = Path(__file__).resolve().parents[1]
 PLAN_NAME = "sandbox.tfplan"
 MANIFEST_NAME = "manifest.json"
+OPERATIONS = ("create", "destroy")
+ACR_PULL_ROLE = "7f951dda-4ed3-4680-a7ca-43fe172d538d"
 ADDRESSES = {
     "azurerm_resource_group.sandbox",
     "azurerm_container_registry.sandbox",
@@ -91,19 +93,22 @@ def source_digest():
 
 
 def same_id(actual, expected):
-    return isinstance(actual, str) and actual.rstrip("/").lower() == expected.lower()
+    return (isinstance(actual, str) and isinstance(expected, str)
+            and actual.rstrip("/").lower() == expected.lower())
 
 
-def validate_plan(document, settings, inputs):
-    """Fail closed on state outside the sandbox, deletes, imports, and replacement."""
+def validate_plan_header(document, inputs):
     if document.get("terraform_version") != VERSION or document.get("errored", False):
         raise ValueError("Plan version mismatch or errored Terraform plan.")
     planned_inputs = {key: value["value"] for key, value in document.get("variables", {}).items()}
     if planned_inputs != inputs:
         raise ValueError("Plan variables differ from the committed sandbox inputs.")
-    changes = document.get("resource_changes", [])
-    if {item["address"] for item in changes} != ADDRESSES or len(changes) != len(ADDRESSES):
-        raise ValueError("Plan must contain only the four declared sandbox resources.")
+
+
+def sandbox_layout(settings, inputs):
+    names = ("resource_group_name", "node_resource_group_name", "cluster_name", "acr_name")
+    if not all(isinstance(inputs.get(name), str) for name in names):
+        raise ValueError("Sandbox resource names must be strings.")
     base = f"/subscriptions/{settings['subscription_id']}/resourceGroups/{inputs['resource_group_name']}"
     acr = base + "/providers/Microsoft.ContainerRegistry/registries/" + inputs["acr_name"]
     cluster = base + "/providers/Microsoft.ContainerService/managedClusters/" + inputs["cluster_name"]
@@ -114,6 +119,16 @@ def validate_plan(document, settings, inputs):
             or len({inputs["resource_group_name"], inputs["node_resource_group_name"],
                     settings["resource_group_name"]}) != 3):
         raise ValueError("Sandbox names collide with state storage or leave the sandbox namespace.")
+    return base, acr, cluster
+
+
+def validate_plan(document, settings, inputs):
+    """Create mode never permits deletes, imports, moves, or replacements."""
+    validate_plan_header(document, inputs)
+    changes = document.get("resource_changes", [])
+    if {item["address"] for item in changes} != ADDRESSES or len(changes) != len(ADDRESSES):
+        raise ValueError("Plan must contain only the four declared sandbox resources.")
+    base, acr, cluster = sandbox_layout(settings, inputs)
     expected_names = {
         "azurerm_resource_group.sandbox": (inputs["resource_group_name"], base),
         "azurerm_container_registry.sandbox": (inputs["acr_name"], acr),
@@ -162,6 +177,107 @@ def validate_plan(document, settings, inputs):
                     raise ValueError("Unknown role scope must reference the sandbox ACR directly.")
 
 
+def validate_destroy_resource(address, values, settings, inputs):
+    """Check real state identities, not merely Terraform address labels."""
+    if not isinstance(values, dict):
+        raise ValueError("Destroy state resource values must be an object.")
+    base, acr, cluster = sandbox_layout(settings, inputs)
+    expected = {
+        "azurerm_resource_group.sandbox": (inputs["resource_group_name"], base),
+        "azurerm_container_registry.sandbox": (inputs["acr_name"], acr),
+        "azurerm_kubernetes_cluster.sandbox": (inputs["cluster_name"], cluster),
+    }
+    if address in expected:
+        name, identifier = expected[address]
+        if not same_id(values.get("id"), identifier) or values.get("name") != name:
+            raise ValueError("Destroy state references an unexpected Azure resource identity.")
+        if values.get("location") != settings["location"]:
+            raise ValueError("Destroy resource location does not match the sandbox.")
+        if address != "azurerm_resource_group.sandbox" and values.get("resource_group_name") != inputs["resource_group_name"]:
+            raise ValueError("Destroy resource is outside the sandbox group.")
+        tags = values.get("tags") or {}
+        if (not isinstance(tags, dict) or tags.get("managed-by") != "terraform"
+                or tags.get("environment") != settings["environment"]):
+            raise ValueError("Destroy requires matching Terraform ownership/environment tags.")
+        if address == "azurerm_kubernetes_cluster.sandbox" and values.get("node_resource_group") != inputs["node_resource_group_name"]:
+            raise ValueError("Destroy cluster has an unexpected managed node group.")
+    elif address == "azurerm_role_assignment.acr_pull":
+        prefix = acr.lower() + "/providers/microsoft.authorization/roleassignments/"
+        identifier = values.get("id", "")
+        if (not isinstance(identifier, str) or not identifier.lower().startswith(prefix)
+                or not same_id(values.get("scope"), acr)):
+            raise ValueError("Destroy role assignment must be scoped to the sandbox ACR.")
+        validate_uuid(identifier[len(prefix):])
+        validate_uuid(values.get("principal_id"))
+        if values.get("role_definition_name") != "AcrPull":
+            raise ValueError("Destroy may remove only the sandbox AcrPull assignment.")
+        role_id = values.get("role_definition_id")
+        if role_id and (not isinstance(role_id, str) or not role_id.lower().endswith("/" + ACR_PULL_ROLE)):
+            raise ValueError("Destroy role definition ID does not match AcrPull.")
+    else:
+        raise ValueError("Destroy refuses a resource outside the sandbox allowlist.")
+
+
+def validate_destroy_state(document, settings, inputs):
+    if not isinstance(document, dict):
+        raise ValueError("Destroy state must be a JSON object.")
+    values = document.get("values") or {}
+    if not isinstance(values, dict):
+        raise ValueError("Destroy state values must be a JSON object.")
+    root = values.get("root_module") or {}
+    if not isinstance(root, dict):
+        raise ValueError("Destroy state root module must be a JSON object.")
+    if root.get("child_modules"):
+        raise ValueError("Destroy refuses unexpected modules in the state.")
+    resources = root.get("resources") or []
+    if not resources:
+        raise ValueError("Refusing destroy: state is empty. A plan-only create run does not provision resources.")
+    if not isinstance(resources, list):
+        raise ValueError("Destroy state resources must be an array.")
+    inventory = {}
+    for resource in resources:
+        if not isinstance(resource, dict):
+            raise ValueError("Destroy state resource must be an object.")
+        address = resource.get("address")
+        if (resource.get("mode") != "managed" or address not in ADDRESSES or address in inventory
+                or resource.get("provider_name") != "registry.terraform.io/hashicorp/azurerm"):
+            raise ValueError("Destroy state contains unexpected or duplicate resource addresses.")
+        values = resource.get("values") or {}
+        validate_destroy_resource(address, values, settings, inputs)
+        inventory[address] = values
+    cluster = inventory.get("azurerm_kubernetes_cluster.sandbox")
+    role = inventory.get("azurerm_role_assignment.acr_pull")
+    if cluster and role:
+        kubelets = cluster.get("kubelet_identity") or []
+        if (not isinstance(kubelets, list) or len(kubelets) != 1 or not isinstance(kubelets[0], dict)
+                or not same_id(role.get("principal_id"), kubelets[0].get("object_id", ""))):
+            raise ValueError("Destroy AcrPull principal does not match the sandbox kubelet identity.")
+    return inventory
+
+
+def validate_destroy_plan(document, settings, inputs):
+    validate_plan_header(document, inputs)
+    prior = validate_destroy_state(document.get("prior_state") or {}, settings, inputs)
+    changes = document.get("resource_changes") or []
+    if not changes or {item["address"] for item in changes} != set(prior) or len(changes) != len(prior):
+        raise ValueError("Destroy plan must delete exactly its nonempty refreshed sandbox inventory.")
+    planned = (document.get("planned_values") or {}).get("root_module") or {}
+    if planned.get("resources") or planned.get("child_modules"):
+        raise ValueError("Destroy plan must not retain or create managed resources.")
+    for item in changes:
+        change = item["change"]
+        if (item.get("mode") != "managed" or item.get("previous_address")
+                or item.get("provider_name") != "registry.terraform.io/hashicorp/azurerm"
+                or change.get("importing") or change["actions"] != ["delete"]
+                or change.get("after") is not None):
+            raise ValueError("Destroy plan permits deletes only, not creates, updates, moves, imports, or replacements.")
+        before = change.get("before") or {}
+        validate_destroy_resource(item["address"], before, settings, inputs)
+        if before != prior[item["address"]]:
+            raise ValueError("Destroy plan and refreshed state disagree about the resource being deleted.")
+    return prior
+
+
 def terraform_call(binary, args, env, json_output=False, accepted=(0,)):
     command = [binary, f"-chdir={ROOT / 'terraform'}", *args]
     result = subprocess.run(command, env=env, check=False, text=True,
@@ -172,46 +288,76 @@ def terraform_call(binary, args, env, json_output=False, accepted=(0,)):
     return json.loads(result.stdout) if json_output else result.returncode
 
 
-def plan(bundle, binary, env, settings, inputs, identity):
+def plan(bundle, binary, env, settings, inputs, identity, operation="create"):
+    if operation not in OPERATIONS:
+        raise ValueError("Unknown Terraform lifecycle operation.")
+    if operation == "destroy":
+        state = terraform_call(binary, ["show", "-json"], env, json_output=True)
+        validate_destroy_state(state, settings, inputs)
     bundle.mkdir(parents=True, exist_ok=False, mode=0o700)
     plan_path = bundle / PLAN_NAME
-    terraform_call(binary, ["plan", "-input=false", "-lock-timeout=5m",
-                           "-detailed-exitcode", f"-out={plan_path}"], env, accepted=(0, 2))
+    arguments = ["plan", "-input=false", "-lock-timeout=5m",
+                 "-detailed-exitcode", f"-out={plan_path}"]
+    if operation == "destroy":
+        arguments.append("-destroy")
+    terraform_call(binary, arguments, env, accepted=(0, 2))
     plan_path.chmod(0o600)
     document = terraform_call(binary, ["show", "-json", str(plan_path)], env, json_output=True)
-    validate_plan(document, settings, inputs)
-    manifest = dict(identity, source_sha256=source_digest(),
+    validator = validate_destroy_plan if operation == "destroy" else validate_plan
+    validator(document, settings, inputs)
+    manifest = dict(identity, operation=operation, source_sha256=source_digest(),
                     plan_sha256=hashlib.sha256(plan_path.read_bytes()).hexdigest())
     path = bundle / MANIFEST_NAME
     path.write_text(json.dumps(manifest, indent=2) + "\n")
     path.chmod(0o600)
-    print("Sandbox-only plan validated; review the Terraform plan log before approving.")
+    label = "destroy " if operation == "destroy" else ""
+    print(f"Sandbox-only {label}plan validated; review the Terraform plan log before approving.")
 
 
-def apply(bundle, binary, env, settings, inputs, identity):
+def apply(bundle, binary, env, settings, inputs, identity, operation="create"):
+    if operation not in OPERATIONS:
+        raise ValueError("Unknown Terraform lifecycle operation.")
     if {p.name for p in bundle.iterdir()} != {PLAN_NAME, MANIFEST_NAME}:
         raise ValueError("Plan artifact must contain exactly its binary plan and manifest.")
     if any(p.is_symlink() or not p.is_file() for p in bundle.iterdir()):
         raise ValueError("Plan artifact must contain regular files, not links.")
     plan_path = bundle / PLAN_NAME
     manifest = json.loads((bundle / MANIFEST_NAME).read_text())
-    expected = dict(identity, source_sha256=source_digest(),
+    expected = dict(identity, operation=operation, source_sha256=source_digest(),
                     plan_sha256=hashlib.sha256(plan_path.read_bytes()).hexdigest())
     if manifest != expected:
         raise ValueError("Plan hash, source, run, commit, version, or pipeline identity mismatch.")
     document = terraform_call(binary, ["show", "-json", str(plan_path)], env, json_output=True)
-    validate_plan(document, settings, inputs)
+    validator = validate_destroy_plan if operation == "destroy" else validate_plan
+    planned = validator(document, settings, inputs)
+    if operation == "destroy":
+        state = terraform_call(binary, ["show", "-json"], env, json_output=True)
+        current = validate_destroy_state(state, settings, inputs)
+        for address, values in planned.items():
+            if address not in current or not same_id(current[address].get("id"), values["id"]):
+                raise ValueError("Current sandbox inventory no longer matches the reviewed destroy plan.")
     terraform_call(binary, ["apply", "-input=false", "-lock-timeout=5m", str(plan_path)], env)
 
 
-def execute(action, bundle, source):
+def execute(action, bundle, source, operation="create"):
+    if action not in ("plan", "apply") or operation not in OPERATIONS:
+        raise ValueError("Unknown Terraform lifecycle action or operation.")
     settings = load_config(DEFAULT_CONFIG)
     inputs = json.loads((ROOT / "terraform" / "sandbox.auto.tfvars.json").read_text())
     provisioning = source.get("PROVISION_REQUESTED", "false").lower() == "true"
-    if (action == "apply" or provisioning) and source.get("SANDBOX_CONFIRMATION") != settings["environment"]:
-        raise ValueError("Provisioning requires the exact sandbox environment confirmation.")
-    if action == "apply" and not provisioning:
-        raise ValueError("Apply requires an explicit provisioning request.")
+    destroying = source.get("DESTROY_REQUESTED", "false").lower() == "true"
+    if operation == "destroy":
+        if provisioning or source.get("DESTRUCTION_CONFIRMATION") != f"destroy {settings['environment']}":
+            raise ValueError("Destroy preview/apply requires the exact phrase: destroy " + settings["environment"])
+        if action == "apply" and not destroying:
+            raise ValueError("Destroy apply requires an explicit deletion request.")
+    else:
+        if destroying:
+            raise ValueError("Create mode cannot accept a deletion request.")
+        if (action == "apply" or provisioning) and source.get("SANDBOX_CONFIRMATION") != settings["environment"]:
+            raise ValueError("Provisioning requires the exact sandbox environment confirmation.")
+        if action == "apply" and not provisioning:
+            raise ValueError("Apply requires an explicit provisioning request.")
     bundle = Path(bundle).resolve()
     if bundle == ROOT or ROOT in bundle.parents:
         raise ValueError("Keep plan artifacts outside the source checkout.")
@@ -243,18 +389,19 @@ def execute(action, bundle, source):
         terraform_call(binary, ["fmt", "-check", "-recursive"], env)
         terraform_call(binary, ["validate", "-no-color"], env)
         if action == "plan":
-            plan(bundle, binary, env, settings, inputs, identity)
+            plan(bundle, binary, env, settings, inputs, identity, operation=operation)
         else:
-            apply(bundle, binary, env, settings, inputs, identity)
+            apply(bundle, binary, env, settings, inputs, identity, operation=operation)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "apply"))
+    parser.add_argument("--operation", choices=OPERATIONS, default="create")
     parser.add_argument("--bundle-dir", required=True, type=Path)
     args = parser.parse_args()
     try:
-        execute(args.action, args.bundle_dir, os.environ)
+        execute(args.action, args.bundle_dir, os.environ, operation=args.operation)
         return 0
     except (ValueError, RuntimeError, OSError, KeyError, TypeError, StopIteration) as exc:
         # Never dump the environment, tokens, state, or parsed plan JSON.

@@ -104,7 +104,8 @@ class EnvironmentContextTests(unittest.TestCase):
         template = (ROOT / "pipelines/templates/terraform-job-steps.yml").read_text()
         self.assertIn("Verify private project and sandbox environment context", template)
         self.assertIn("buildType: current", template)
-        self.assertIn("artifactName: sandbox-plan", template)
+        self.assertIn("default: sandbox-plan", template)
+        self.assertIn("artifactName: ${{ parameters.artifactName }}", template)
 
 
 if __name__ == "__main__":

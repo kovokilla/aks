@@ -188,7 +188,7 @@ class SavedPlanTests(unittest.TestCase):
         self.bundle.mkdir()
         path = self.bundle / runner.PLAN_NAME
         path.write_bytes(b"synthetic plan")
-        manifest = dict(self.identity, source_sha256=runner.source_digest(),
+        manifest = dict(self.identity, operation="create", source_sha256=runner.source_digest(),
                         plan_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
         (self.bundle / runner.MANIFEST_NAME).write_text(json.dumps(manifest))
 

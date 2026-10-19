@@ -4,10 +4,28 @@ parameters:
   values:
   - plan
   - apply
+- name: operation
+  type: string
+  default: create
+  values:
+  - create
+  - destroy
+- name: artifactName
+  type: string
+  default: sandbox-plan
+  values:
+  - sandbox-plan
+  - sandbox-destroy-plan
 - name: provisionResources
   type: boolean
   default: false
 - name: confirmEnvironment
+  type: string
+  default: not-confirmed
+- name: destroyResources
+  type: boolean
+  default: false
+- name: confirmDestruction
   type: string
   default: not-confirmed
 
@@ -43,11 +61,11 @@ steps:
     displayName: Download the reviewed plan from this run only
     inputs:
       buildType: current
-      artifactName: sandbox-plan
-      targetPath: $(Pipeline.Workspace)/sandbox-plan
+      artifactName: ${{ parameters.artifactName }}
+      targetPath: $(Pipeline.Workspace)/${{ parameters.artifactName }}
 
 - task: AzureCLI@2
-  displayName: Terraform ${{ parameters.action }} with federated Azure authentication
+  displayName: Terraform ${{ parameters.operation }} ${{ parameters.action }} with federated Azure authentication
   inputs:
     azureSubscription: azure-service-connection
     addSpnToEnvironment: true
@@ -57,6 +75,7 @@ steps:
     workingDirectory: $(Build.SourcesDirectory)
     inlineScript: |
       python3 scripts/pipeline_terraform.py ${{ parameters.action }} \
+        --operation ${{ parameters.operation }} \
         --bundle-dir "$PLAN_BUNDLE_DIR"
   env:
     SYSTEM_ACCESSTOKEN: $(System.AccessToken)
@@ -65,12 +84,14 @@ steps:
     TF_SOURCE_COMMIT: $(Build.SourceVersion)
     PROVISION_REQUESTED: '${{ parameters.provisionResources }}'
     SANDBOX_CONFIRMATION: ${{ parameters.confirmEnvironment }}
-    PLAN_BUNDLE_DIR: $(Pipeline.Workspace)/sandbox-plan
+    DESTROY_REQUESTED: '${{ parameters.destroyResources }}'
+    DESTRUCTION_CONFIRMATION: ${{ parameters.confirmDestruction }}
+    PLAN_BUNDLE_DIR: $(Pipeline.Workspace)/${{ parameters.artifactName }}
 
-- ${{ if and(eq(parameters.action, 'plan'), eq(parameters.provisionResources, true)) }}:
+- ${{ if and(eq(parameters.action, 'plan'), or(and(eq(parameters.operation, 'create'), eq(parameters.provisionResources, true)), and(eq(parameters.operation, 'destroy'), eq(parameters.destroyResources, true)))) }}:
   - task: PublishPipelineArtifact@1
     displayName: Publish protected binary plan and manifest for review
     inputs:
-      targetPath: $(Pipeline.Workspace)/sandbox-plan
-      artifact: sandbox-plan
+      targetPath: $(Pipeline.Workspace)/${{ parameters.artifactName }}
+      artifact: ${{ parameters.artifactName }}
       publishLocation: pipeline
